@@ -421,6 +421,14 @@ config MTD_NAND_INTEL_LGM
 	  Enables support for NAND Flash chips on Intel's LGM SoC.
 	  NAND flash controller interfaced through the External Bus Unit.
 
+config MTD_NAND_LOONGSON2
+	tristate "NAND Flash device on Loongson-2K"
+	depends on LOONGARCH
+	depends on HAS_DMA
+	help
+	  Enables the driver for the NAND flash controller on Loongson-2K
+	  series SoCs.
+
 config MTD_NAND_ROCKCHIP
 	tristate "Rockchip NAND controller"
 	depends on ARCH_ROCKCHIP && HAS_IOMEM
