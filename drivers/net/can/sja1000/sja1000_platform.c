@@ -38,6 +38,15 @@ struct technologic_priv {
 	spinlock_t      io_lock;
 };
 
+struct ls2k1000_priv {
+	int irq;
+	u8 isrc, status, rxerr, txerr;
+	int last_rxerr, last_tx, canewl, skipnrxonerr;
+	u8 last_isrc, last_status;
+	uint64_t last_cnt;
+	spinlock_t      io_lock;
+};
+
 static u8 sp_read_reg8(const struct sja1000_priv *priv, int reg)
 {
 	return ioread8(priv->reg_base + reg);
@@ -106,6 +115,107 @@ static void sp_technologic_init(struct sja1000_priv *priv, struct device_node *o
 static void sp_rzn1_init(struct sja1000_priv *priv, struct device_node *of)
 {
 	priv->flags = SJA1000_QUIRK_NO_CDR_REG | SJA1000_QUIRK_RESET_ON_OVERRUN;
+}
+
+static u8 sp_ls2k1000_read_reg8(const struct sja1000_priv *priv, int reg)
+{
+	struct ls2k1000_priv *lp = priv->priv;
+	u8 d;
+
+	d = ioread8(priv->reg_base + reg);
+	if (reg == SJA1000_IR && (d || lp->last_tx)) {
+		u8 isrc = d;
+		u8 status = ioread8(priv->reg_base + SJA1000_SR);
+
+		if (lp->last_tx && !(isrc & IRQ_TI)) {
+			if ((status & SR_TBS) && netif_queue_stopped(lp->priv->dev))
+				isrc |= IRQ_TI;
+		}
+		if (isrc & IRQ_TI) {
+			lp->last_tx = 0;
+			if (!netif_queue_stopped(lp->priv->dev))
+				isrc &= ~IRQ_TI;
+		}
+		if (isrc & IRQ_EI)
+			lp->last_rxerr = lp->skipnrxonerr;
+		if (isrc & IRQ_RI) {
+			while ((status & SR_RBS) && lp->last_rxerr) {
+				sja1000_write_cmdreg(priv, CMD_RRB);
+				lp->last_rxerr--;
+				status = ioread8(priv->reg_base + SJA1000_SR);
+			}
+		}
+		if (isrc & IRQ_EI) {
+			long flags;
+			u8 mode, ecc;
+
+			lp->rxerr = ioread8(priv->reg_base + SJA1000_TXERR);
+			lp->txerr = ioread8(priv->reg_base + SJA1000_RXERR);
+			spin_lock_irqsave(&priv->cmdreg_lock, flags);
+			mode = ioread8(priv->reg_base + SJA1000_MOD) & ~MOD_RM;
+			if (status & SR_BS) {
+				iowrite8(MOD_RM, priv->reg_base + SJA1000_MOD);
+				iowrite8(0xff, priv->reg_base + SJA1000_TXERR);
+				iowrite8(mode, priv->reg_base + SJA1000_MOD);
+				udelay(1);
+			}
+			iowrite8(MOD_RM, priv->reg_base + SJA1000_MOD);
+			iowrite8(0, priv->reg_base + SJA1000_TXERR);
+			iowrite8(0, priv->reg_base + SJA1000_RXERR);
+			iowrite8(mode, priv->reg_base + SJA1000_MOD);
+			spin_unlock_irqrestore(&priv->cmdreg_lock, flags);
+			ecc = ioread8(priv->reg_base + SJA1000_ECC);
+			/* reset mode will clear logic need_to_tx, we resend */
+			if (lp->last_tx) {
+				unsigned long flags;
+
+				spin_lock_irqsave(&priv->cmdreg_lock, flags);
+				iowrite8(0x80 | CMD_TR, priv->reg_base + SJA1000_CMR);
+				lp->last_tx = lp->last_tx + 1 ?: 1;
+				wmb();
+				spin_unlock_irqrestore(&priv->cmdreg_lock, flags);
+			}
+		}
+		d = isrc;
+		lp->status |= status;
+		lp->isrc |= isrc;
+	} else if (reg == SJA1000_SR) {
+		lp->status |= d;
+	} else if (reg == SJA1000_TXERR) {
+		d = (lp->isrc & IRQ_EI) ? lp->txerr : ioread8(priv->reg_base + SJA1000_TXERR);
+	} else if (reg == SJA1000_RXERR) {
+		d = (lp->isrc & IRQ_EI) ? lp->rxerr : ioread8(priv->reg_base + SJA1000_RXERR);
+	}
+	return d;
+}
+
+static void can_ls2k_write_reg8(const struct sja1000_priv *priv, int reg,
+				u8 val)
+{
+	struct ls2k1000_priv *lp = priv->priv;
+
+	if (reg == SJA1000_CMR)
+		val |= 0x80;
+	iowrite8(val, priv->reg_base + reg);
+	if (reg == SJA1000_CMR && (val & CMD_RRB)) {
+		u8 sr;
+		sr = ioread8(priv->reg_base + SJA1000_SR);
+		if ((sr & SR_TCS) == 0 && (sr & SR_TBS))
+			iowrite8(CMD_TR, priv->reg_base + reg);
+	}
+	if (reg == SJA1000_CMR && (val & CMD_TR)) {
+		lp->last_tx = 1;
+		wmb();
+	}
+}
+
+static void sp_ls2k1000_init(struct sja1000_priv *priv, struct device_node *of)
+{
+	struct ls2k1000_priv *lp = priv->priv;
+
+	priv->read_reg = sp_ls2k1000_read_reg8;
+	priv->write_reg = sp_ls2k1000_write_reg8;
+	spin_lock_init(&lp->io_lock);
 }
 
 static void sp_populate(struct sja1000_priv *priv,
@@ -203,10 +313,16 @@ static struct sja1000_of_data renesas_data = {
 	.init = sp_rzn1_init,
 };
 
+static struct sja1000_of_data ls2k1000_data = {
+	.priv_sz = sizeof(struct ls2k1000_priv),
+	.init = sp_ls2k1000_init,
+};
+
 static const struct of_device_id sp_of_table[] = {
 	{ .compatible = "nxp,sja1000", .data = NULL, },
 	{ .compatible = "renesas,rzn1-sja1000", .data = &renesas_data, },
 	{ .compatible = "technologic,sja1000", .data = &technologic_data, },
+	{ .compatible = "loongson,ls2k1000-sja1000", .data = &ls2k1000_data, },
 	{ /* sentinel */ },
 };
 MODULE_DEVICE_TABLE(of, sp_of_table);
