@@ -903,6 +903,14 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 		if (!res)
 			return ERR_PTR(-EINVAL);
 
+		ret = aperture_remove_conflicting_devices(res->start,
+							  resource_size(res),
+							  DRIVER_NAME);
+		if (ret) {
+			drm_err(dev, "Remove firmware framebuffers failed: %d\n", ret);
+			return ERR_PTR(ret);
+		}
+
 		ret = devm_aperture_acquire_for_platform_device(pdev, res->start,
 								resource_size(res));
 		if (ret) {
