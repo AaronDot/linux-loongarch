@@ -13952,8 +13952,10 @@ F:	drivers/soc/loongson/loongson2_guts.c
 LOONGSON-2 SOC SERIES MMC/SD/SDIO CONTROLLER DRIVER
 M:	Binbin Zhou <zhoubinbin@loongson.cn>
 L:	linux-mmc@vger.kernel.org
-S:	Supported
+S:	Maintained
 F:	Documentation/devicetree/bindings/mmc/loongson,ls2k-mmc.yaml
+F:	drivers/mmc/host/loongson2-mmc.c
+F:	drivers/mmc/host/loongson2-mmc.h
 
 LOONGSON-2 SOC SERIES PM DRIVER
 M:	Yinbo Zhu <zhuyinbo@loongson.cn>
