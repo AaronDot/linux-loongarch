@@ -41,6 +41,14 @@
 	};
 };
 
+&apbdma3 {
+	status = "okay";
+};
+
+&mmc0 {
+	status = "okay";
+};
+
 &gmac0 {
 	status = "okay";
 
