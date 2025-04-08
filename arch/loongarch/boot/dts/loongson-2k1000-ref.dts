@@ -48,6 +48,17 @@
 	};
 };
 
+&apbdma1 {
+	status = "okay";
+};
+
+&mmc0 {
+	status = "okay";
+
+	pinctrl-0 = <&sdio_pins_default>;
+	pinctrl-names = "default";
+};
+
 &gmac0 {
 	status = "okay";
 
