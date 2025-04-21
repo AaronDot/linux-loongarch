@@ -24,8 +24,10 @@
 #include <linux/minmax.h>
 #include <linux/stop_machine.h>
 
-#define LS2K_IPMI_RES_SIZE	0x1c
+#define LS2K_DISPLAY_RES_START	(SZ_16M + SZ_2M)
 #define LS2K_IPMI0_RES_START	(SZ_16M + 0xf00000)
+
+#define LS2K_IPMI_RES_SIZE	0x1c
 #define LS2K_IPMI1_RES_START	(LS2K_IPMI0_RES_START + LS2K_IPMI_RES_SIZE)
 #define LS2K_IPMI2_RES_START	(LS2K_IPMI1_RES_START + LS2K_IPMI_RES_SIZE)
 #define LS2K_IPMI3_RES_START	(LS2K_IPMI2_RES_START + LS2K_IPMI_RES_SIZE)
@@ -53,10 +55,6 @@ struct ls2kbmc_pdata {
 	struct ls2kbmc_pci_data pci_data;
 	struct resource simpledrm_res;
 	struct simplefb_platform_data pd;
-};
-
-static struct resource ls2k_display_resources[] = {
-	DEFINE_RES_MEM_NAMED(SZ_16M + SZ_2M, SZ_4M, "simpledrm-res"),
 };
 
 static struct resource ls2k_ipmi_resources[] = {
@@ -319,15 +317,19 @@ static int ls2kbmc_pdata_initial(struct pci_dev *pdev, struct ls2kbmc_pdata *pri
 
 static int ls2k_bmc_register_simplefb(struct pci_dev *dev, struct ls2kbmc_pdata *priv)
 {
-	long phybase;
-
 	ls2kbmc_get_video_mode(dev, priv);
 
+#if 0
+	long phybase;
 	phybase = pci_resource_start(dev, 0) + pci_resource_len(dev, 0) - 0x1000000 + 0x200000;
 	priv->simpledrm_res.start = phybase;
 	priv->simpledrm_res.end	= phybase + SZ_4M - 1;
 	priv->simpledrm_res.flags = IORESOURCE_MEM;
-
+#else
+	priv->simpledrm_res.start = dev->resource[0].start + LS2K_DISPLAY_RES_START;
+	priv->simpledrm_res.end	= priv->simpledrm_res.start + SZ_4M - 1;
+	priv->simpledrm_res.flags = IORESOURCE_MEM;
+#endif
 	priv->pdev = platform_device_register_resndata(NULL, "simple-framebuffer", 0,
 						       &priv->simpledrm_res, 1,
 						       &priv->pd, sizeof(priv->pd));
