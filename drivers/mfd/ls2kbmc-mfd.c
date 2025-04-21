@@ -38,7 +38,6 @@ static const u32 index[] = { 0x4, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24,
 			     0x30, 0x3c, 0x54, 0x58, 0x78, 0x7c, 0x80 };
 static const u32 cindex[] = { 0x4, 0x10, 0x3c };
 
-
 struct ls2kbmc_pci_data {
 	u32 d80c;
 	u32 d71c;
@@ -52,6 +51,7 @@ struct ls2kbmc_pdata {
 	struct work_struct bmc_work;
 	unsigned long reset_time;
 	struct ls2kbmc_pci_data pci_data;
+	struct resource simpledrm_res;
 	struct simplefb_platform_data pd;
 };
 
@@ -230,7 +230,7 @@ static void ls2kbmc_events_fn(struct work_struct *work)
 
 	/* We need to re-push the display due to previous pcie loss. */
 	priv->pdev = platform_device_register_resndata(NULL, "simple-framebuffer", 0,
-						       &ls2k_display_resources[0], 1,
+						       &priv->simpledrm_res, 1,
 						       &priv->pd, sizeof(priv->pd));
 }
 
@@ -319,14 +319,21 @@ static int ls2kbmc_pdata_initial(struct pci_dev *pdev, struct ls2kbmc_pdata *pri
 
 static int ls2k_bmc_register_simplefb(struct pci_dev *dev, struct ls2kbmc_pdata *priv)
 {
+	long phybase;
+
 	ls2kbmc_get_video_mode(dev, priv);
 
+	phybase = pci_resource_start(dev, 0) + pci_resource_len(dev, 0) - 0x1000000 + 0x200000;
+	priv->simpledrm_res.start = phybase;
+	priv->simpledrm_res.end	= phybase + SZ_4M - 1;
+	priv->simpledrm_res.flags = IORESOURCE_MEM;
+
 	priv->pdev = platform_device_register_resndata(NULL, "simple-framebuffer", 0,
-						       &ls2k_display_resources[0], 1,
+						       &priv->simpledrm_res, 1,
 						       &priv->pd, sizeof(priv->pd));
 
-	if (IS_ERR(priv->pdev))
-		return -ENOMEM;
+	if (PTR_ERR_OR_ZERO(priv->pdev))
+		return PTR_ERR_OR_ZERO(priv->pdev);
 
 	return 0;
 }
