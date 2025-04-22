@@ -19,6 +19,7 @@
 #include <linux/pci_ids.h>
 #include <linux/platform_data/simplefb.h>
 #include <linux/platform_device.h>
+#include <linux/aperture.h>
 
 #include <linux/delay.h>
 #include <linux/minmax.h>
@@ -317,6 +318,7 @@ static int ls2kbmc_pdata_initial(struct pci_dev *pdev, struct ls2kbmc_pdata *pri
 
 static int ls2k_bmc_register_simplefb(struct pci_dev *dev, struct ls2kbmc_pdata *priv)
 {
+	int ret;
 	ls2kbmc_get_video_mode(dev, priv);
 
 #if 0
@@ -330,6 +332,15 @@ static int ls2k_bmc_register_simplefb(struct pci_dev *dev, struct ls2kbmc_pdata 
 	priv->simpledrm_res.end	= priv->simpledrm_res.start + SZ_4M - 1;
 	priv->simpledrm_res.flags = IORESOURCE_MEM;
 #endif
+
+	ret = aperture_remove_conflicting_devices(priv->simpledrm_res.start,
+						  resource_size(&priv->simpledrm_res),
+						  "simple-framebuffer");
+	if (ret) {
+		dev_err(&dev->dev, "Remove firmware framebuffers failed: %d\n", ret);
+		return ret;
+	}
+
 	priv->pdev = platform_device_register_resndata(NULL, "simple-framebuffer", 0,
 						       &priv->simpledrm_res, 1,
 						       &priv->pd, sizeof(priv->pd));
