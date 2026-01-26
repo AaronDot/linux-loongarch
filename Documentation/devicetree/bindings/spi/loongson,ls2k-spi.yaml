@@ -19,6 +19,7 @@ properties:
           - loongson,ls2k1000-spi
       - items:
           - enum:
+              - loongson,ls2k0300-spi
               - loongson,ls2k0500-spi
           - const: loongson,ls2k1000-spi
 
