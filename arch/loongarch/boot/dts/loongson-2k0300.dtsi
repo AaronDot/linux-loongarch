@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2025 Loongson Technology Corporation Limited
+ * Copyright (C) 2025 Yao Zi <ziyao@disroot.org>
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/clock/loongson,ls2k-clk.h>
+#include <dt-bindings/reset/loongson,ls2k0300-reset.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+#define PINMUX(pin, func)	(((pin) << 8) | func)
+
+/ {
+	compatible = "loongson,ls2k0300";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			compatible = "loongson,la264";
+			reg = <0>;
+			device_type = "cpu";
+			clocks = <&clk LS2K0300_CLK_NODE_GATE>;
+		};
+
+	};
+
+	cpuintc: interrupt-controller {
+		compatible = "loongson,cpu-interrupt-controller";
+		interrupt-controller;
+		#interrupt-cells = <1>;
+	};
+
+	refclk: clock-120m {
+		compatible = "fixed-clock";
+		clock-frequency = <120000000>;
+		clock-output-names = "refclk_120m";
+		#clock-cells = <0>;
+	};
+
+	soc@10000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x00 0x10000000 0x00 0x10000000 0x0 0x10000000>,
+			 <0x00 0x02000000 0x00 0x02000000 0x0 0x04000000>,
+			 <0x00 0x40000000 0x00 0x40000000 0x0 0x40000000>;
+
+		rst: reset-controller@1600011c {
+			compatible = "loongson,ls2k0300-reset";
+			reg = <0x0 0x1600011c 0x0 0x8>;
+			#reset-cells = <1>;
+		};
+
+		clk: clock-controller@16000400 {
+			compatible = "loongson,ls2k0300-clk";
+			reg = <0x0 0x16000400 0x0 0x30>;
+			clocks = <&refclk>;
+			#clock-cells = <1>;
+		};
+
+		pinctrl: pinctrl@16000490 {
+			compatible = "loongson,ls2k0300-pinctrl";
+			reg = <0x0 0x16000490 0x0 0x20>,
+			      <0x0 0x16000110 0x0 0x4>;
+			reg-names = "mux", "drive";
+		};
+
+		liointc0: interrupt-controller@16001400 {
+			compatible = "loongson,liointc-2.0";
+			reg = <0x0 0x16001400 0x0 0x40>,
+			      <0x0 0x16001040 0x0 0x8>;
+			reg-names = "main", "isr0";
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			interrupt-parent = <&cpuintc>;
+			interrupts = <2>;
+			interrupt-names = "int0";
+
+			loongson,parent_int_map = <0xffffffff>, /* int0 */
+						  <0x00000000>, /* int1 */
+						  <0x00000000>, /* int2 */
+						  <0x00000000>; /* int3 */
+		};
+
+		liointc1: interrupt-controller@16001440 {
+			compatible = "loongson,liointc-2.0";
+			reg = <0x0 0x16001440 0x0 0x40>,
+			      <0x0 0x16001048 0x0 0x8>;
+			reg-names = "main", "isr0";
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			interrupt-parent = <&cpuintc>;
+			interrupts = <4>;
+			interrupt-names = "int2";
+
+			loongson,parent_int_map = <0x00000000>, /* int0 */
+						  <0x00000000>, /* int1 */
+						  <0xffffffff>, /* int2 */
+						  <0x00000000>; /* int3 */
+		};
+
+		tsensor: thermal-sensor@16001500 {
+			compatible = "loongson,ls2k0300-thermal";
+			reg = <0x0 0x16001500 0x0 0x30>,
+			      <0x0 0x16003ff0 0x0 0x8>;
+			interrupt-parent = <&liointc1>;
+			interrupts = <20 IRQ_TYPE_LEVEL_HIGH>;
+			#thermal-sensor-cells = <1>;
+			status = "disabled";
+		};
+
+		spi0: spi@16010000 {
+			compatible = "loongson,ls2k0300-spi", "loongson,ls2k1000-spi";
+			reg = <0 0x16010000 0 0x10>;
+			clocks = <&clk LS2K0300_CLK_BOOT_GATE>;
+			status = "disabled";
+		};
+
+		spi1: spi@16018000 {
+			compatible = "loongson,ls2k0300-spi", "loongson,ls2k1000-spi";
+			reg = <0 0x16018000 0 0x10>;
+			clocks = <&clk LS2K0300_CLK_BOOT_GATE>;
+			status = "disabled";
+		};
+
+		gmac0: ethernet@16020000 {
+			compatible = "snps,dwmac-3.70a";
+			reg = <0x0 0x16020000 0x0 0x10000>;
+			clocks = <&clk LS2K0300_CLK_GMAC_GATE>;
+			clock-names = "stmmaceth";
+			interrupt-parent = <&liointc1>;
+			interrupts = <17 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "macirq";
+			status = "disabled";
+		};
+
+		gmac1: ethernet@16030000 {
+			compatible = "snps,dwmac-3.70a";
+			reg = <0x0 0x16030000 0x0 0x10000>;
+			clocks = <&clk LS2K0300_CLK_GMAC_GATE>;
+			clock-names = "stmmaceth";
+			interrupt-parent = <&liointc1>;
+			interrupts = <18 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "macirq";
+			status = "disabled";
+		};
+
+		ehci: usb@16080000 {
+			compatible = "generic-ehci";
+			reg = <0 0x16080000 0 0x8000>;
+			clocks = <&clk LS2K0300_CLK_USB_GATE>;
+			interrupt-parent = <&liointc1>;
+			interrupts = <14 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		ohci: usb@16088000 {
+			compatible = "generic-ohci";
+			reg = <0 0x16088000 0 0x8000>;
+			clocks = <&clk LS2K0300_CLK_USB_GATE>;
+			interrupt-parent = <&liointc1>;
+			interrupts = <15 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		uart0: serial@16100000 {
+			compatible = "ns16550a";
+			reg = <0 0x16100000 0 0x10>;
+			clocks = <&clk LS2K0300_CLK_APB_GATE>;
+			resets = <&rst RST_UART0>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <0 IRQ_TYPE_LEVEL_HIGH>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart1: serial@16100400 {
+			compatible = "ns16550a";
+			reg = <0 0x16100400 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <1 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART1>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart2: serial@16100800 {
+			compatible = "ns16550a";
+			reg = <0 0x16100800 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART2>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart3: serial@16100c00 {
+			compatible = "ns16550a";
+			reg = <0 0x16100c00 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART3>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart4: serial@16101000 {
+			compatible = "ns16550a";
+			reg = <0 0x16101000 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART4>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart5: serial@16101400 {
+			compatible = "ns16550a";
+			reg = <0 0x16101400 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART5>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart6: serial@16101800 {
+			compatible = "ns16550a";
+			reg = <0 0x16101800 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <3 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART6>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart7: serial@16101c00 {
+			compatible = "ns16550a";
+			reg = <0 0x16101c00 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <3 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART7>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart8: serial@16102000 {
+			compatible = "ns16550a";
+			reg = <0 0x16102000 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <3 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART8>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		uart9: serial@16102400 {
+			compatible = "ns16550a";
+			reg = <0 0x16102400 0 0x10>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <3 IRQ_TYPE_LEVEL_HIGH>;
+			resets = <&rst RST_UART9>;
+			no-loopback-test;
+			status = "disabled";
+		};
+
+		gpio: gpio@16104000 {
+			compatible = "loongson,ls2k0300-gpio";
+			reg = <0x0 0x16104000 0x0 0x4000>;
+			interrupt-parent = <&liointc1>;
+			interrupts = <21 IRQ_TYPE_LEVEL_HIGH>,
+				     <22 IRQ_TYPE_LEVEL_HIGH>,
+				     <23 IRQ_TYPE_LEVEL_HIGH>,
+				     <24 IRQ_TYPE_LEVEL_HIGH>,
+				     <25 IRQ_TYPE_LEVEL_HIGH>,
+				     <26 IRQ_TYPE_LEVEL_HIGH>,
+				     <27 IRQ_TYPE_LEVEL_HIGH>;
+			ngpios = <106>;
+			gpio-controller;
+			gpio-ranges = <&pinctrl 0 0 106>;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			resets = <&rst RST_GPIO>;
+		};
+
+		i2c0: i2c@16108000 {
+			compatible = "loongson,ls2k0300-i2c";
+			reg = <0 0x16108000 0 0x1000>;
+			clocks = <&clk LS2K0300_CLK_DEV_GATE>;
+			clock-frequency = <400000>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <4 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		i2c1: i2c@16109000 {
+			compatible = "loongson,ls2k0300-i2c";
+			reg = <0 0x16109000 0 0x1000>;
+			clocks = <&clk LS2K0300_CLK_DEV_GATE>;
+			clock-frequency = <400000>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <4 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		i2c2: i2c@1610a000 {
+			compatible = "loongson,ls2k0300-i2c";
+			reg = <0 0x1610a000 0 0x1000>;
+			clocks = <&clk LS2K0300_CLK_DEV_GATE>;
+			clock-frequency = <400000>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <5 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		i2c3: i2c@1610b000 {
+			compatible = "loongson,ls2k0300-i2c";
+			reg = <0 0x1610b000 0 0x1000>;
+			clocks = <&clk LS2K0300_CLK_DEV_GATE>;
+			clock-frequency = <400000>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <5 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		i2s: i2s@16114000 {
+			compatible = "loongson,ls2k0300-i2s";
+			reg = <0 0x16114000 0 0x10>;
+			clocks = <&clk LS2K0300_CLK_I2S_GATE>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <12 IRQ_TYPE_LEVEL_HIGH>;
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		wdt: watchdog@16124000 {
+			compatible = "loongson,ls2k0300-wdt";
+			reg = <0x0 0x16124000 0 0xc>;
+			clocks = <&clk LS2K0300_CLK_APB_GATE>;
+			status = "disabled";
+		};
+
+		rtc: rtc@16128000{
+			compatible = "loongson,ls2k0300-rtc";
+			reg = <0 0x16128000 0 0x100>;
+			status = "disabled";
+		};
+
+		dma: dma-controller@1612c000 {
+			compatible = "loongson,ls2k0300-dma";
+			reg = <0 0x1612c000 0 0xff>;
+			clocks = <&clk LS2K0300_CLK_APB_GATE>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <23 IRQ_TYPE_LEVEL_HIGH>,
+				     <24 IRQ_TYPE_LEVEL_HIGH>,
+				     <25 IRQ_TYPE_LEVEL_HIGH>,
+				     <26 IRQ_TYPE_LEVEL_HIGH>,
+				     <27 IRQ_TYPE_LEVEL_HIGH>,
+				     <28 IRQ_TYPE_LEVEL_HIGH>,
+				     <29 IRQ_TYPE_LEVEL_HIGH>,
+				     <30 IRQ_TYPE_LEVEL_HIGH>;
+			#dma-cells = <2>;
+			dma-channels = <8>;
+			status = "disabled";
+		};
+
+		emmc: mmc@16140000 {
+			compatible = "loongson,ls2k0300-mmc";
+			reg = <0x0 0x16140000 0x0 0x1000>;
+			clocks = <&clk LS2K0300_CLK_SDIO_GATE>;
+			interrupt-parent = <&liointc0>;
+			interrupts = <31 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		sdio: mmc@16148000 {
+			compatible = "loongson,ls2k0300-mmc";
+			reg = <0x0 0x16148000 0x0 0x8000>;
+			clocks = <&clk LS2K0300_CLK_SDIO_GATE>;
+			interrupt-parent = <&liointc1>;
+			interrupts = <0 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		isa@16400000 {
+			compatible = "isa";
+			#address-cells = <2>;
+			#size-cells = <1>;
+			ranges = <1 0x0 0x0 0x16400000 0x4000>;
+		};
+	};
+};
