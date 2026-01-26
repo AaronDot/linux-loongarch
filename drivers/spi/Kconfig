@@ -616,6 +616,12 @@ config SPI_LOONGSON_PLATFORM
 	  Say Y or M here if you want to use the SPI controller on
 	  Loongson platform.
 
+config SPI_LOONGSON_IO
+	tristate "Loongson SPI-IO Controller Support"
+	depends on LOONGARCH || COMPILE_TEST
+	help
+	  This is the driver for Loongson spi-io controller.
+
 config SPI_LP8841_RTC
 	tristate "ICP DAS LP-8841 SPI Controller for RTC"
 	depends on MACH_PXA27X_DT || COMPILE_TEST
