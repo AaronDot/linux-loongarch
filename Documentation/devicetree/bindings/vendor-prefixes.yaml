@@ -86,6 +86,8 @@ patternProperties:
     description: Aldec, Inc.
   "^alfa-network,.*":
     description: ALFA Network Inc.
+  "^alientek,.*":
+    description: Guangzhou Xingyi Electronic Technology Co., Ltd
   "^algoltek,.*":
     description: AlgolTek, Inc.
   "^allegro,.*":
