@@ -150,6 +150,7 @@ KBUILD_RUSTFLAGS_KERNEL		+= -Crelocation-model=pie
 LDFLAGS_vmlinux			+= -static -pie --no-dynamic-linker -z notext $(call ld-option, --apply-dynamic-relocs)
 endif
 
+entry-y = $(shell LC_ALL=C readelf -e vmlinux | grep 'Entry point address:'|grep -o '0x[0-9a-f]\{16\}')
 cflags-y += $(call cc-option, -mno-check-zero-division -fno-isolate-erroneous-paths-dereference)
 
 ifndef CONFIG_KASAN
@@ -162,7 +163,8 @@ else
 load-y		= 0x9000000000200000
 endif
 
-bootvars-y	= VMLINUX_LOAD_ADDRESS=$(load-y)
+bootvars-y	= VMLINUX_LOAD_ADDRESS=$(load-y) \
+		  VMLINUX_ENTRY_ADDRESS=$(entry-y)
 
 drivers-$(CONFIG_PCI)		+= arch/loongarch/pci/
 
@@ -214,7 +216,7 @@ all:	$(notdir $(KBUILD_IMAGE)) $(KBUILD_DTBS)
 
 vmlinuz.efi: vmlinux.efi
 
-vmlinux.elf vmlinux.efi vmlinuz.efi: vmlinux
+vmlinux.elf vmlinux.efi vmlinuz.efi uImage: vmlinux
 	$(Q)$(MAKE) $(build)=$(boot) $(bootvars-y) $(boot)/$@
 
 install:

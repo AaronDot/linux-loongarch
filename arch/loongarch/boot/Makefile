@@ -29,4 +29,38 @@ EFI_ZBOOT_BFD_TARGET   := elf64-loongarch
 EFI_ZBOOT_MACH_TYPE    := LOONGARCH64
 endif
 
+suffix-y			:= bin
+suffix-$(CONFIG_KERNEL_BZIP2)	:= bz2
+suffix-$(CONFIG_KERNEL_GZIP)	:= gz
+suffix-$(CONFIG_KERNEL_LZMA)	:= lzma
+suffix-$(CONFIG_KERNEL_LZO)	:= lzo
+
+targets += uImage uImage.bin uImage.bz2 uImage.gz uImage.lzma uImage.lzo
+
+UIMAGE_LOADADDR  = $(VMLINUX_LOAD_ADDRESS)
+UIMAGE_ENTRYADDR = $(VMLINUX_ENTRY_ADDRESS)
+
+#
+# Compressed u-boot images
+#
+
+$(obj)/uImage.bin: $(obj)/vmlinux.bin FORCE
+	$(call if_changed,uimage,none)
+
+$(obj)/uImage.bz2: $(obj)/vmlinux.bin.bz2 FORCE
+	$(call if_changed,uimage,bzip2)
+
+$(obj)/uImage.gz: $(obj)/vmlinux.bin.gz FORCE
+	$(call if_changed,uimage,gzip)
+
+$(obj)/uImage.lzma: $(obj)/vmlinux.bin.lzma FORCE
+	$(call if_changed,uimage,lzma)
+
+$(obj)/uImage.lzo: $(obj)/vmlinux.bin.lzo FORCE
+	$(call if_changed,uimage,lzo)
+
+$(obj)/uImage: $(obj)/uImage.$(suffix-y)
+	@ln -sf $(notdir $<) $@
+	@echo '  Image $@ is ready'
+
 include $(srctree)/drivers/firmware/efi/libstub/Makefile.zboot
