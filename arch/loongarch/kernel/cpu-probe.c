@@ -277,6 +277,8 @@ static void cpu_probe_common(struct cpuinfo_loongarch *c)
 
 	if (get_num_brps() + get_num_wrps())
 		c->options |= LOONGARCH_CPU_WATCH;
+
+	csr_write64(0x300000000, 0xf0);
 }
 
 #define MAX_NAME_LEN	32
