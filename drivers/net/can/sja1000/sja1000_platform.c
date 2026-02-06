@@ -4,6 +4,7 @@
  * Copyright (C) 2007 Wolfgang Grandegger <wg@grandegger.com>
  */
 
+#include <linux/acpi.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/interrupt.h>
@@ -211,6 +212,12 @@ static const struct of_device_id sp_of_table[] = {
 };
 MODULE_DEVICE_TABLE(of, sp_of_table);
 
+static const struct acpi_device_id sp_acpi_match[] = {
+	{ "LOON0009" }, /* LoongArch */
+	{ /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(acpi, sp_acpi_match);
+
 static int sp_probe(struct platform_device *pdev)
 {
 	int err, irq = 0;
@@ -224,10 +231,17 @@ static int sp_probe(struct platform_device *pdev)
 	size_t priv_sz = 0;
 	struct clk *clk;
 
-	pdata = dev_get_platdata(&pdev->dev);
-	if (!pdata && !of) {
-		dev_err(&pdev->dev, "No platform data provided!\n");
-		return -ENODEV;
+       if (has_acpi_companion(&pdev->dev)) {
+               struct sja1000_platform_data data;
+               memset(&data, 0, sizeof(data));
+               pdata = &data;
+               device_property_read_u32(&pdev->dev, "clock", &pdata->osc_freq);
+       } else {
+               pdata = dev_get_platdata(&pdev->dev);
+               if (!pdata && !of) {
+                       dev_err(&pdev->dev, "No platform data provided!\n");
+                       return -ENODEV;
+               }
 	}
 
 	addr = devm_platform_get_and_ioremap_resource(pdev, 0, &res_mem);
@@ -324,6 +338,7 @@ static struct platform_driver sp_driver = {
 	.driver = {
 		.name = DRV_NAME,
 		.of_match_table = sp_of_table,
+		.acpi_match_table = sp_acpi_match,
 	},
 };
 
