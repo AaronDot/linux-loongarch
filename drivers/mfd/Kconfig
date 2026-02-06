@@ -2487,6 +2487,17 @@ config MFD_INTEL_M10_BMC_PMCI
 	  additional drivers must be enabled in order to use the functionality
 	  of the device.
 
+config MFD_LOONGSON_TIMERS
+	tristate "Loongson-2K Timers Support"
+	depends on (LOONGARCH && OF) || COMPILE_TEST
+	select MFD_CORE
+	select REGMAP
+	select REGMAP_MMIO
+	help
+	  Select this option to enable Loongson timers driver used
+	  for PWM and IIO Timer. This driver allow to share the
+	  registers between the others drivers.
+
 config MFD_LOONGSON_SE
 	tristate "Loongson Security Engine chip controller driver"
 	depends on LOONGARCH && ACPI
