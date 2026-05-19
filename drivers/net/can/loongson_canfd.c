@@ -6,10 +6,14 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/acpi_dma.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/can/dev.h>
 #include <linux/can/error.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-direction.h>
+#include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -376,8 +380,10 @@
 #define DEV_NAME			"loongson_canfd"
 #define LOONGSON_CANFD_ID		0xBABE
 #define LOONGSON_CANFD_DW_BYTE		4
+#define LOONGSON_CANFD_RXBUF_SZ		SZ_1K
 #define LOONGSON_CANFD_TXBUF_NUM	8
 #define LOONGSON_CANFD_MAX_RTXTH	0xf
+#define LOONGSON_CANFD_RXDMA_NUM	(LOONGSON_CANFD_RXBUF_SZ / DMA_SLAVE_BUSWIDTH_4_BYTES)
 
 /**
  * struct loongson_canfd_priv - This definition define CAN driver instance
@@ -385,14 +391,26 @@
  * @napi: NAPI structure
  * @regmap: regmap of the CAN device
  * @res: Pointer to the CAN device respurce
+ * @rx_ch: CAN DMA rx channel
+ * @rx_dma_buf: CAN DMA rx buffer bus address
+ * @rx_buf: CAN DMA rx buffer cpu address
+ * @rx_frc: Last rx data in DMA route
  * @tx_lock: Lock for synchronizing TX interrupt handling
+ * @get_rx_data:  Callback of reading CAN rx data
+ * @get_rx_frc: Callback of the number of messages in the receive buffer
  */
 struct loongson_canfd_priv {
 	struct can_priv		can;		/* must be first member! */
 	struct napi_struct	napi;
 	struct regmap		*regmap;
 	struct resource		*res;
+	struct dma_chan		*rx_ch;
+	dma_addr_t		rx_dma_buf;	/* dma rx buffer bus address */
+	unsigned int		*rx_buf;	/* dma rx buffer cpu address */
+	u16			rx_frc;
 	spinlock_t		tx_lock;	/* protect the sending queue */
+	u32 (*get_rx_data)(struct loongson_canfd_priv *priv);
+	bool (*get_rx_frc)(struct loongson_canfd_priv *priv);
 };
 
 /**
@@ -612,6 +630,125 @@ static int loongson_canfd_reset(struct net_device *ndev)
 	regmap_write(priv->regmap, LOONGSON_CANFD_MODE, REG_MODE_RXBAM | REG_MODE_BUFM);
 
 	return 0;
+}
+
+/**
+ * loongson_canfd_get_rxdata_in_dma() - Reading RX data in DMA mode
+ * @priv: Pointer to private data
+ *
+ * Return: The CANFD RX data.
+ */
+static u32 loongson_canfd_get_rxdata_in_dma(struct loongson_canfd_priv *priv)
+{
+	u32 c = 0;
+
+	c = priv->rx_buf[LOONGSON_CANFD_RXDMA_NUM - priv->rx_frc--];
+	if (priv->rx_frc == 0)
+		priv->rx_frc = LOONGSON_CANFD_RXDMA_NUM;
+
+	return c;
+}
+
+/**
+ * loongson_canfd_rxfrc_in_dma() - Gets he number of messages in the receive buffer in DMA mode
+ * @priv: Pointer to private data
+ *
+ * Return: The number of messages in the receive buffer
+ */
+static bool loongson_canfd_rxfrc_in_dma(struct loongson_canfd_priv *priv)
+{
+	struct dma_tx_state state;
+	enum dma_status status;
+
+	status = dmaengine_tx_status(priv->rx_ch, priv->rx_ch->cookie, &state);
+
+	return priv->rx_frc != (state.residue / DMA_SLAVE_BUSWIDTH_4_BYTES) &&
+	       (status == DMA_IN_PROGRESS);
+}
+
+static void loongson_canfd_rxdma_remove(struct loongson_canfd_priv *priv, struct device *dev)
+{
+	dma_free_coherent(dev, LOONGSON_CANFD_RXBUF_SZ, priv->rx_buf, priv->rx_dma_buf);
+}
+
+/**
+ * loongson_canfd_rxdma_init() - Loongson canfd RXDMA initialization
+ * @ndev: Pointer to net_device structure
+ *
+ * Return: The number of messages in the receive buffer
+ */
+static int loongson_canfd_rxdma_init(struct net_device *ndev)
+{
+	struct loongson_canfd_priv *priv = netdev_priv(ndev);
+	struct dma_async_tx_descriptor *desc = NULL;
+	struct device *dev = ndev->dev.parent;
+	struct dma_slave_config config;
+	int ret;
+
+	priv->rx_buf = dma_alloc_coherent(dev, LOONGSON_CANFD_RXBUF_SZ,
+					  &priv->rx_dma_buf, GFP_KERNEL);
+	if (!priv->rx_buf)
+		return -ENOMEM;
+
+	/* Configure DMA channel */
+	memset(&config, 0, sizeof(config));
+	config.src_addr = priv->res->start + LOONGSON_CANFD_RX_DATA;
+	config.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+
+	ret = dmaengine_slave_config(priv->rx_ch, &config);
+	if (ret < 0) {
+		netdev_err(ndev, "Loongson canfd rxdma channel config failed\n");
+		goto err_config;
+	}
+
+	/* Prepare a DMA cyclic transaction */
+	desc = dmaengine_prep_dma_cyclic(priv->rx_ch, priv->rx_dma_buf,
+					 LOONGSON_CANFD_RXBUF_SZ, LOONGSON_CANFD_RXBUF_SZ,
+					 DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT);
+	if (!desc) {
+		netdev_err(ndev, "Loongson canfd rxdma cyclic transaction failed\n");
+		ret = -EBUSY;
+		goto err_config;
+	}
+
+	dmaengine_submit(desc);
+	dma_async_issue_pending(priv->rx_ch);
+
+	return 0;
+
+err_config:
+	loongson_canfd_rxdma_remove(priv, dev);
+	return ret;
+}
+
+/**
+ * loongson_canfd_get_rxdata_in_poll() - Reading RX data in poll mode
+ * @priv: Pointer to private data
+ *
+ * Return: The CANFD RX data.
+ */
+static u32 loongson_canfd_get_rxdata_in_poll(struct loongson_canfd_priv *priv)
+{
+	u32 data;
+
+	regmap_read(priv->regmap, LOONGSON_CANFD_RX_DATA, &data);
+
+	return data;
+}
+
+/**
+ * loongson_canfd_rxfrc_in_poll() - Gets he number of messages in the receive buffer in poll mode
+ * @priv: Pointer to private data
+ *
+ * Return: The number of messages in the receive buffer
+ */
+static bool loongson_canfd_rxfrc_in_poll(struct loongson_canfd_priv *priv)
+{
+	u32 rx_sts;
+
+	regmap_read(priv->regmap, LOONGSON_CANFD_RX_STAT, &rx_sts);
+
+	return FIELD_GET(REG_RX_STAT_RXFRC, rx_sts) ? true : false;
 }
 
 /**
@@ -838,8 +975,8 @@ static int loongson_canfd_chip_start(struct net_device *ndev)
 	loongson_canfd_set_mode(priv, &mode);
 
 	/* Configure interrupts */
-	int_ena = REG_INT_STAT_RBNEI | REG_INT_STAT_TXBHCI |
-		  REG_INT_STAT_EWLI | REG_INT_STAT_FCSI;
+	int_ena = REG_INT_STAT_TXBHCI | REG_INT_STAT_EWLI | REG_INT_STAT_FCSI;
+	int_ena |= priv->rx_ch ? REG_INT_STAT_DMADI : REG_INT_STAT_RBNEI;
 
 	/* Bus error reporting */
 	if (priv->can.ctrlmode & CAN_CTRLMODE_BERR_REPORTING)
@@ -1074,12 +1211,12 @@ static void loongson_canfd_read_rx_frame(struct loongson_canfd_priv *priv, struc
 
 	/* Data */
 	for (i = 0; i < len; i += LOONGSON_CANFD_DW_BYTE) {
-		regmap_read(priv->regmap, LOONGSON_CANFD_RX_DATA, &data);
+		data = priv->get_rx_data(priv);
 		*(__le32 *)(cf->data + i) = cpu_to_le32(data);
 	}
 
 	while (unlikely(i < wc * LOONGSON_CANFD_DW_BYTE)) {
-		regmap_read(priv->regmap, LOONGSON_CANFD_RX_DATA, &data);
+		data = priv->get_rx_data(priv);
 		i += LOONGSON_CANFD_DW_BYTE;
 	}
 }
@@ -1101,8 +1238,8 @@ static int loongson_canfd_rx(struct net_device *ndev)
 	struct sk_buff *skb;
 	u32 meta0, meta1;
 
-	regmap_read(priv->regmap, LOONGSON_CANFD_RX_DATA, &meta0);
-	regmap_read(priv->regmap, LOONGSON_CANFD_RX_DATA, &meta1);
+	meta0 = priv->get_rx_data(priv);
+	meta1 = priv->get_rx_data(priv);
 
 	/* Number of characters received */
 	if (!FIELD_GET(REG_FRAME_META1_RWCNT, meta1))
@@ -1328,16 +1465,16 @@ static int loongson_canfd_rx_napi(struct napi_struct *napi, int quota)
 	struct net_device *ndev = napi->dev;
 	struct loongson_canfd_priv *priv = netdev_priv(ndev);
 	int work_done = 0, ret = 1;
-	u32 sts, rx_frc, rx_sts;
+	int int_ena = priv->rx_ch ? REG_INT_STAT_DMADI : REG_INT_STAT_RBNEI;
+	bool rx_frc;
+	u32 sts;
 
-	regmap_read(priv->regmap, LOONGSON_CANFD_RX_STAT, &rx_sts);
-	rx_frc = FIELD_GET(REG_RX_STAT_RXFRC, rx_sts);
+	rx_frc = priv->get_rx_frc(priv);
 
 	while (rx_frc && work_done < quota && ret > 0) {
 		ret = loongson_canfd_rx(ndev);
 		work_done++;
-		regmap_read(priv->regmap, LOONGSON_CANFD_RX_STAT, &rx_sts);
-		rx_frc = FIELD_GET(REG_RX_STAT_RXFRC, rx_sts);
+		rx_frc = priv->get_rx_frc(priv);
 	}
 
 	/* Check for RX FIFO Overflow */
@@ -1367,13 +1504,11 @@ static int loongson_canfd_rx_napi(struct napi_struct *napi, int quota)
 	if (!rx_frc && ret != 0) {
 		if (napi_complete_done(napi, work_done)) {
 			/*
-			 * Clear and enable RBNEI. It is level-triggered, so
+			 * Clear and enable RBNEI/DMADI. It is level-triggered, so
 			 * there is no race condition.
 			 */
-			regmap_write(priv->regmap, LOONGSON_CANFD_INT_STAT,
-				     REG_INT_STAT_RBNEI);
-			regmap_write(priv->regmap, LOONGSON_CANFD_INT_MASK,
-				     (REG_INT_STAT_RBNEI << 16));
+			regmap_write(priv->regmap, LOONGSON_CANFD_INT_STAT, int_ena);
+			regmap_write(priv->regmap, LOONGSON_CANFD_INT_MASK, (int_ena << 16));
 		}
 	}
 
@@ -1460,13 +1595,14 @@ static irqreturn_t loongson_canfd_interrupt(int irq, void *dev_id)
 			return irq_loops ? IRQ_HANDLED : IRQ_NONE;
 
 		/* Receive Buffer Not Empty Interrupt */
-		if (isr & REG_INT_STAT_RBNEI) {
+		imask = priv->rx_ch ? REG_INT_STAT_DMADI : REG_INT_STAT_RBNEI;
+		if (isr & imask) {
 			/*
 			 * Mask RXBNEI the first, then clear interrupt and schedule NAPI.
 			 * Even if another IRQ fires, RBNEI will always be 0 (masked).
 			 */
-			regmap_write(priv->regmap, LOONGSON_CANFD_INT_MASK, REG_INT_STAT_RBNEI);
-			regmap_write(priv->regmap, LOONGSON_CANFD_INT_STAT, REG_INT_STAT_RBNEI);
+			regmap_write(priv->regmap, LOONGSON_CANFD_INT_MASK, imask);
+			regmap_write(priv->regmap, LOONGSON_CANFD_INT_STAT, imask);
 			napi_schedule(&priv->napi);
 		}
 
@@ -1663,6 +1799,7 @@ static int loongson_canfd_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct loongson_canfd_priv *priv;
 	struct net_device *ndev;
+	struct dma_chan *rx_ch;
 	struct regmap *regmap;
 	struct resource *res;
 	void __iomem *base;
@@ -1683,14 +1820,24 @@ static int loongson_canfd_probe(struct platform_device *pdev)
 	if (irq < 0)
 		return irq;
 
+	rx_ch = dma_request_chan(dev, "rx");
+	if (PTR_ERR(rx_ch) == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
+
+	if (IS_ERR(rx_ch)) {
+		dev_warn(dev, "Fall back in poll mode for any non-deferral error.\n");
+		rx_ch = NULL;
+	}
+
 	/* Create a CAN device instance */
 	ndev = alloc_candev(sizeof(*priv), LOONGSON_CANFD_TXBUF_NUM);
 	if (!ndev)
-		return -ENOMEM;
+		goto err_dma_rx;
 
 	priv = netdev_priv(ndev);
 	spin_lock_init(&priv->tx_lock);
 	priv->regmap = regmap;
+	priv->rx_ch = rx_ch;
 	priv->res = res;
 
 	priv->can.clock.freq = clk_rate;
@@ -1720,6 +1867,19 @@ static int loongson_canfd_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_candev_free;
 
+	if (priv->rx_ch) {
+		priv->get_rx_data = loongson_canfd_get_rxdata_in_dma;
+		priv->get_rx_frc = loongson_canfd_rxfrc_in_dma;
+		priv->rx_frc = LOONGSON_CANFD_RXDMA_NUM;
+		ret = loongson_canfd_rxdma_init(ndev);
+		if (ret) {
+			dev_err(dev, "interrupt mode used for rx (no dma)\n");
+			goto err_candev_free;
+		}
+	} else {
+		priv->get_rx_data = loongson_canfd_get_rxdata_in_poll;
+		priv->get_rx_frc = loongson_canfd_rxfrc_in_poll;
+	}
 	netif_napi_add(ndev, &priv->napi, loongson_canfd_rx_napi);
 
 	ret = register_candev(ndev);
@@ -1732,6 +1892,9 @@ static int loongson_canfd_probe(struct platform_device *pdev)
 
 err_candev_free:
 	free_candev(ndev);
+err_dma_rx:
+	if (rx_ch)
+		dma_release_channel(rx_ch);
 	return ret;
 }
 
@@ -1739,6 +1902,11 @@ static void loongson_canfd_remove(struct platform_device *pdev)
 {
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct loongson_canfd_priv *priv = netdev_priv(ndev);
+
+	if (priv->rx_ch) {
+		loongson_canfd_rxdma_remove(priv, &pdev->dev);
+		dma_release_channel(priv->rx_ch);
+	}
 
 	unregister_candev(ndev);
 	netif_napi_del(&priv->napi);
@@ -1761,6 +1929,7 @@ static struct platform_driver loongson_canfd_driver = {
 };
 module_platform_driver(loongson_canfd_driver);
 
+MODULE_SOFTDEP("pre: loongson2-apb-cmc-dma");
 MODULE_AUTHOR("Loongson Technology Corporation Limited");
 MODULE_DESCRIPTION("Loongson CAN-FD Controller driver");
 MODULE_LICENSE("GPL");
