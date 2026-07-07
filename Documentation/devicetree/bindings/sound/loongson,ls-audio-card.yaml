@@ -68,6 +68,24 @@ required:
 
 unevaluatedProperties: false
 
+if:
+  properties:
+    compatible:
+      contains:
+        const: loongson,ls2k0300-dl2k0300b-audio-card
+
+then:
+  required:
+    - spkr-en-gpios
+    - hp-ctl-gpios
+    - hp-det-gpios
+
+else:
+  properties:
+    spkr-en-gpios: false
+    hp-ctl-gpios: false
+    hp-det-gpios: false
+
 examples:
   - |
     sound {
