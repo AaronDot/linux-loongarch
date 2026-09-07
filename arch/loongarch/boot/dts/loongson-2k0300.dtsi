@@ -133,7 +133,7 @@
 			status = "disabled";
 		};
 
-		spi@16018000 {
+		spi1: spi@16018000 {
 			compatible = "loongson,ls2k0300-spi-flash", "loongson,ls2k1000-spi";
 			reg = <0 0x16018000 0 0x10>;
 			clocks = <&clk LS2K0300_CLK_BOOT_GATE>;
@@ -343,7 +343,7 @@
 			status = "disabled";
 		};
 
-		spi@1610c000 {
+		spi2: spi@1610c000 {
 			compatible = "loongson,ls2k0300-spi-io";
 			reg = <0 0x1610c000 0 0x2000>;
 			clocks = <&clk LS2K0300_CLK_DEV_GATE>;

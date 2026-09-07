@@ -90,6 +90,41 @@
 	};
 };
 
+//&spi1 {
+//	status = "okay";
+//
+//	pinctrl-0 = <&spi1_pins>;
+//	pinctrl-names = "default";
+//
+//	#address-cells = <1>;
+//	#size-cells = <0>;
+//
+//	flash@0 {
+//		compatible = "jedec,spi-nor";
+//		spi-max-frequency = <25000000>;
+//		reg = <0>;
+//	};
+//};
+
+&spi2 {
+	status = "okay";
+
+	pinctrl-0 = <&spi2_pins>;
+	pinctrl-names = "default";
+
+	dmas =  <&dma 1 0x8e>, <&dma 0 0x8e>;
+	dma-names = "tx", "rx";
+
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		spi-max-frequency = <25000000>;
+		reg = <0>;
+	};
+};
+
 &tsensor {
 	status = "okay";
 };
@@ -146,7 +181,7 @@
 &i2s {
 	status = "okay";
 
-	dmas = <&dma 1 0xbf>, <&dma 0 0xaf>;
+	dmas = <&dma 7 0xbf>, <&dma 6 0xaf>;
 	dma-names = "tx", "rx";
 };
 
@@ -158,4 +193,22 @@
 	no-sd;
 	no-sdio;
 	bus-width = <8>;
+};
+
+&pinctrl {
+	func-spi {
+		spi1_pins: spi1-pins {
+			pinmux = <PINMUX(60, 0x3)>,
+				 <PINMUX(61, 0x3)>,
+				 <PINMUX(62, 0x3)>,
+				 <PINMUX(63, 0x3)>;
+		};
+
+		spi2_pins: spi2-pins {
+			pinmux = <PINMUX(64, 0x3)>,
+				 <PINMUX(65, 0x3)>,
+				 <PINMUX(66, 0x3)>,
+				 <PINMUX(67, 0x3)>;
+		};
+	};
 };
