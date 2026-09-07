@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0+
+//
 // PCI interface driver for Loongson SPI Support
-// Copyright (C) 2023 Loongson Technology Corporation Limited
+//
+// Copyright (C) 2023-2026 Loongson Technology Corporation Limited
 
 #include <linux/pci.h>
 
 #include "spi-loongson.h"
 
-static int loongson_spi_pci_register(struct pci_dev *pdev,
-			const struct pci_device_id *ent)
+static int loongson_spi_pci_register(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
-	int ret;
-	void __iomem *reg_base;
 	struct device *dev = &pdev->dev;
-	int pci_bar = 0;
+	void __iomem *reg_base;
+	int pci_bar = 0, ret;
 
 	ret = pcim_enable_device(pdev);
 	if (ret < 0)

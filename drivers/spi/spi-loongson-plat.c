@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+
+//
 // Platform driver for Loongson SPI Support
-// Copyright (C) 2023 Loongson Technology Corporation Limited
+//
+// Copyright (C) 2023-2026 Loongson Technology Corporation Limited
 
 #include <linux/err.h>
 #include <linux/platform_device.h>
@@ -9,9 +11,9 @@
 
 static int loongson_spi_platform_probe(struct platform_device *pdev)
 {
-	int ret;
-	void __iomem *reg_base;
 	struct device *dev = &pdev->dev;
+	void __iomem *reg_base;
+	int ret;
 
 	reg_base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(reg_base))
