@@ -593,6 +593,7 @@ config SPI_LM70_LLP
 config SPI_LOONGSON_CORE
 	tristate
 	depends on LOONGARCH || COMPILE_TEST
+	select REGMAP_MMIO
 
 config SPI_LOONGSON_PCI
 	tristate "Loongson SPI Controller PCI Driver Support"
