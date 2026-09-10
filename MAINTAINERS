@@ -15389,6 +15389,7 @@ F:	drivers/spi/spi-loongson-flash-core.c
 F:	drivers/spi/spi-loongson-flash-pci.c
 F:	drivers/spi/spi-loongson-flash-plat.c
 F:	drivers/spi/spi-loongson-flash.h
+F:	drivers/spi/spi-loongson-io.c
 
 LOONGSON-2 SOC SERIES GUTS DRIVER
 M:	Yinbo Zhu <zhuyinbo@loongson.cn>

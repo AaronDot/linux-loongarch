@@ -621,6 +621,19 @@ config SPI_LOONGSON_FLASH_PLATFORM
 	  Say Y or M here if you want to use the SPI controller on
 	  Loongson platform.
 
+config SPI_LOONGSON_IO
+	tristate "Loongson SPI-IO Controller Driver"
+	depends on LOONGARCH || COMPILE_TEST
+	depends on OF
+	help
+	  This enables support for the Loongson SPI-IO controller, which is
+	  a separate SPI IP block found on Loongson-2K0300 SPI2/SPI3. It
+	  supports interrupt-driven batch transfers and optional DMA, with
+	  fallback to interrupt mode when DMA is unavailable.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called spi-loongson-io.
+
 config SPI_LP8841_RTC
 	tristate "ICP DAS LP-8841 SPI Controller for RTC"
 	depends on MACH_PXA27X_DT || COMPILE_TEST

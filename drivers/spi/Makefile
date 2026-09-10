@@ -85,6 +85,7 @@ obj-$(CONFIG_SPI_LM70_LLP)		+= spi-lm70llp.o
 obj-$(CONFIG_SPI_LOONGSON_FLASH_CORE)	+= spi-loongson-flash-core.o
 obj-$(CONFIG_SPI_LOONGSON_FLASH_PCI)	+= spi-loongson-flash-pci.o
 obj-$(CONFIG_SPI_LOONGSON_FLASH_PLATFORM)+= spi-loongson-flash-plat.o
+obj-$(CONFIG_SPI_LOONGSON_IO)		+= spi-loongson-io.o
 obj-$(CONFIG_SPI_LP8841_RTC)		+= spi-lp8841-rtc.o
 obj-$(CONFIG_SPI_MA35D1_QSPI)		+= spi-ma35d1-qspi.o
 obj-$(CONFIG_SPI_MESON_SPICC)		+= spi-meson-spicc.o
