@@ -13,13 +13,17 @@ static int loongson_spi_platform_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	void __iomem *reg_base;
-	int ret;
+	int ret, irq;
 
 	reg_base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(reg_base))
 		return PTR_ERR(reg_base);
 
-	ret = loongson_spi_init_controller(dev, reg_base);
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		dev_info(dev, "no IRQ specified, will use PIO mode\n");
+
+	ret = loongson_spi_init_controller(dev, reg_base, irq);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to initialize controller\n");
 

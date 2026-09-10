@@ -7,7 +7,7 @@
 #ifndef __LINUX_SPI_LOONGSON_H
 #define __LINUX_SPI_LOONGSON_H
 
-int loongson_spi_init_controller(struct device *dev, void __iomem *reg);
+int loongson_spi_init_controller(struct device *dev, void __iomem *reg, int irq);
 extern const struct dev_pm_ops loongson_spi_dev_pm_ops;
 
 #endif /* __LINUX_SPI_LOONGSON_H */

@@ -11,8 +11,8 @@
 static int loongson_spi_pci_register(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct device *dev = &pdev->dev;
+	int pci_bar = 0, ret, irq;
 	void __iomem *reg_base;
-	int pci_bar = 0, ret;
 
 	ret = pcim_enable_device(pdev);
 	if (ret < 0)
@@ -23,7 +23,11 @@ static int loongson_spi_pci_register(struct pci_dev *pdev, const struct pci_devi
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to request and remap memory\n");
 
-	ret = loongson_spi_init_controller(dev, reg_base);
+	irq = pci_irq_vector(pdev, 0);
+	if (irq < 0)
+		dev_info(dev, "no IRQ available, will use PIO mode\n");
+
+	ret = loongson_spi_init_controller(dev, reg_base, irq);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to initialize controller\n");
 
