@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+
 //
-// Loongson SPI Controller driver
+// Loongson Flash SPI Controller driver
 //
 // Copyright (C) 2023-2026 Loongson Technology Corporation Limited
 
@@ -16,7 +16,7 @@
 #include <linux/regmap.h>
 #include <linux/spi/spi.h>
 
-#include "spi-loongson.h"
+#include "spi-loongson-flash.h"
 
 /* SPI controller register offsets */
 #define LOONGSON_SPI_SPCR_REG		0x00
@@ -427,5 +427,5 @@ static int loongson_spi_resume(struct device *dev)
 DEFINE_SIMPLE_DEV_PM_OPS(loongson_spi_dev_pm_ops, loongson_spi_suspend, loongson_spi_resume);
 EXPORT_SYMBOL_NS_GPL(loongson_spi_dev_pm_ops, "SPI_LOONGSON_CORE");
 
-MODULE_DESCRIPTION("Loongson SPI core driver");
+MODULE_DESCRIPTION("Loongson Flash SPI core driver");
 MODULE_LICENSE("GPL");

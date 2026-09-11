@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0+
 //
-// PCI interface driver for Loongson SPI Support
+// PCI interface driver for Loongson Flash SPI Support
 //
 // Copyright (C) 2023-2026 Loongson Technology Corporation Limited
 
 #include <linux/pci.h>
 
-#include "spi-loongson.h"
+#include "spi-loongson-flash.h"
 
 static int loongson_spi_pci_register(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
@@ -52,6 +52,6 @@ static struct pci_driver loongson_spi_pci_driver = {
 };
 module_pci_driver(loongson_spi_pci_driver);
 
-MODULE_DESCRIPTION("Loongson spi pci driver");
+MODULE_DESCRIPTION("Loongson flash spi pci driver");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("SPI_LOONGSON_CORE");

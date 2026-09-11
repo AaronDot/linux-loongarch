@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0+
 //
-// Platform driver for Loongson SPI Support
+// Platform driver for Loongson Flash SPI Support
 //
 // Copyright (C) 2023-2026 Loongson Technology Corporation Limited
 
 #include <linux/err.h>
 #include <linux/platform_device.h>
 
-#include "spi-loongson.h"
+#include "spi-loongson-flash.h"
 
 static int loongson_spi_platform_probe(struct platform_device *pdev)
 {
@@ -39,7 +39,7 @@ MODULE_DEVICE_TABLE(of, loongson_spi_id_table);
 static struct platform_driver loongson_spi_plat_driver = {
 	.probe = loongson_spi_platform_probe,
 	.driver	= {
-		.name	= "loongson-spi",
+		.name	= "loongson-spi-flash",
 		.bus = &platform_bus_type,
 		.pm = pm_sleep_ptr(&loongson_spi_dev_pm_ops),
 		.of_match_table = loongson_spi_id_table,
@@ -47,6 +47,6 @@ static struct platform_driver loongson_spi_plat_driver = {
 };
 module_platform_driver(loongson_spi_plat_driver);
 
-MODULE_DESCRIPTION("Loongson spi platform driver");
+MODULE_DESCRIPTION("Loongson flash spi platform driver");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("SPI_LOONGSON_CORE");

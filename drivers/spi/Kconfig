@@ -590,30 +590,34 @@ config SPI_LM70_LLP
 	  which interfaces to an LM70 temperature sensor using
 	  a parallel port.
 
-config SPI_LOONGSON_CORE
+config SPI_LOONGSON_FLASH_CORE
 	tristate
 	depends on LOONGARCH || COMPILE_TEST
 	select REGMAP_MMIO
 
-config SPI_LOONGSON_PCI
-	tristate "Loongson SPI Controller PCI Driver Support"
-	select SPI_LOONGSON_CORE
+config SPI_LOONGSON_FLASH_PCI
+	tristate "Loongson SPI-FLASH Controller PCI Driver"
 	depends on PCI && (LOONGARCH || COMPILE_TEST)
+	select SPI_LOONGSON_FLASH_CORE
 	help
-	  This bus driver supports the Loongson SPI hardware controller in
-	  the Loongson platforms and supports to use PCI framework to
-	  register SPI device resources.
+	  This enables the PCI interface driver for the Loongson SPI-FLASH
+	  controller, which is the SPI controller IP also used on Loongson-2K
+	  series SoCs.
+	  It supports SPI flash memory access and system boot.
+
 	  Say Y or M here if you want to use the SPI controller on
 	  Loongson platform.
 
-config SPI_LOONGSON_PLATFORM
-	tristate "Loongson SPI Controller Platform Driver Support"
-	select SPI_LOONGSON_CORE
+config SPI_LOONGSON_FLASH_PLATFORM
+	tristate "Loongson SPI-FLASH Controller Platform Driver"
 	depends on OF && (LOONGARCH || COMPILE_TEST)
+	select SPI_LOONGSON_FLASH_CORE
 	help
-	  This bus driver supports the Loongson SPI hardware controller in
-	  the Loongson platforms and supports to use DTS framework to
-	  register SPI device resources.
+	  This enables the platform/OF interface driver for the Loongson
+	  SPI-FLASH controller, which is the SPI controller IP also used on
+	  Loongson-2K series SoCs. It supports SPI flash memory access and
+	  system boot.
+
 	  Say Y or M here if you want to use the SPI controller on
 	  Loongson platform.
 
