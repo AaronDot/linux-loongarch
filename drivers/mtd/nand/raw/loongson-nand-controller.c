@@ -771,14 +771,20 @@ static void loongson_nand_controller_cleanup(struct loongson_nand_host *host)
 static int ls2k1000_nand_apbdma_config(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
+	struct resource *res;
 	void __iomem *regs;
-	int val;
+	u32 val;
 
-	regs = devm_platform_ioremap_resource_byname(pdev, "dma-config");
-	if (IS_ERR(regs))
-		return PTR_ERR(regs);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return -EINVAL;
+
+	regs = devm_ioremap(dev, res->start, resource_size(res));
+	if (!regs)
+		return -ENOMEM;
 
 	val = readl(regs);
+	val &= ~LS2K1000_NAND_DMA_MASK;
 	val |= FIELD_PREP(LS2K1000_NAND_DMA_MASK, LS2K1000_DMA0_CONF);
 	writel(val, regs);
 
