@@ -719,14 +719,20 @@ static int ls2k0500_mmc_set_external_dma(struct loongson2_mmc_host *host,
 static int ls2k1000_mmc_set_external_dma(struct loongson2_mmc_host *host,
 					 struct platform_device *pdev)
 {
-	int ret, val;
+	struct resource *res;
 	void __iomem *regs;
+	int ret, val;
 
-	regs = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(regs))
-		return PTR_ERR(regs);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return -EINVAL;
+
+	regs = devm_ioremap(dev, res->start, resource_size(res));
+	if (!regs)
+		return -ENOMEM;
 
 	val = readl(regs);
+	val &= ~LS2K1000_SDIO_DMA_MASK;
 	val |= FIELD_PREP(LS2K1000_SDIO_DMA_MASK, LS2K1000_DMA1_CONF);
 	writel(val, regs);
 
