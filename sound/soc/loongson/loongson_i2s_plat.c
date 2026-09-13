@@ -22,9 +22,6 @@
 #include "loongson_dma.h"
 
 /* Loongson-2K1000 APBDMA routing */
-#define LOONGSON_I2S_RX_DMA_OFFSET	21
-#define LOONGSON_I2S_TX_DMA_OFFSET	18
-
 #define LOONGSON_DMA0_CONF	0x0
 #define LOONGSON_DMA1_CONF	0x1
 #define LOONGSON_DMA2_CONF	0x2
@@ -38,16 +35,21 @@ struct loongson_i2s_plat_config {
 
 static int loongson_i2s_apbdma_config(struct platform_device *pdev)
 {
-	int val;
+	struct resource *res;
 	void __iomem *regs;
+	int val;
 
-	regs = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(regs))
-		return PTR_ERR(regs);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return NULL;
+
+	regs = devm_ioremap(dev, res->start, resource_size(res));
+	if (!regs)
+		return -ENOMEM;
 
 	val = readl(regs);
-	val |= LOONGSON_DMA2_CONF << LOONGSON_I2S_TX_DMA_OFFSET;
-	val |= LOONGSON_DMA3_CONF << LOONGSON_I2S_RX_DMA_OFFSET;
+	val &= ~(LOONGSON_I2S_TX_DMA_MASK | LOONGSON_I2S_RX_DMA_MASK);
+	val |= FIELD_PREP(LS2K1000_SDIO_DMA_MASK, LS2K1000_DMA1_CONF);
 	writel(val, regs);
 
 	return 0;
