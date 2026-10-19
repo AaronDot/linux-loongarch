@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Loongson 2K3000 CAN-FD controller driver with RX DMA support
+ * Loongson 2K3000 CAN-FD controller driver with RX DMA pause/resume
  *
  * Copyright (C) 2024-2026 Loongson Technology Corporation Limited
  *
- * RX DMA uses the loongson2-cmc-dma controller in cyclic mode: the DMA
- * engine copies 32-bit words from LSCANFD_RX_DATA into a 32 KB ring buffer
- * in 4 KB periods.  The CPU reconstructs the write position from the DMA
- * residue and parses frames out of the ring.  When the hardware FIFO is
- * empty the DMA engine keeps reading RX_DATA (which returns zero); the
- * driver detects all-zero headers with RXE=1 and jumps the read pointer
- * onto the current write position instead of sliding word by word.
+ * The CAN controller keeps its DMA request line asserted even when the RX
+ * FIFO is empty; the DMA engine then keeps reading RX_DATA (which returns
+ * zero) and fills the ring with garbage.  To avoid this, the driver pauses
+ * the cyclic DMA channel as soon as the hardware FIFO reports empty, and
+ * resumes it when RBNEI signals a new frame.  As a result the ring only ever
+ * contains real frame data, and rx_wr_pos is frozen while the CPU drains it.
+ *
+ * The sliding/zero-jump logic in lscanfd_rx_one() is kept as a last-resort
+ * safety net for the few words that the DMA engine may still copy between
+ * the RXE assertion and the CCR.EN clear taking effect.
  */
 
 #include <linux/acpi.h>
-#include <linux/acpi_dma.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/can/dev.h>
 #include <linux/can/error.h>
-#include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
@@ -66,9 +68,7 @@
 #define LSCANFD_TX_SEL		0xa4
 #define LSCANFD_TX_DATA		0xb0
 
-/* -------------------------------------------------------------------------
- * CR_MODE (Table 16-3)
- * ---------------------------------------------------------------------- */
+/* CR_MODE / CR_SET / CR_STAT / CR_CMD */
 #define LSCANFD_MODE_RST	BIT(0)
 #define LSCANFD_MODE_BMM	BIT(1)
 #define LSCANFD_MODE_FDE	BIT(4)
@@ -79,18 +79,12 @@
 #define LSCANFD_MODE_RTSOP	BIT(12)
 #define LSCANFD_MODE_BUFM	BIT(13)
 
-/* -------------------------------------------------------------------------
- * CR_SET (Table 16-4)
- * ---------------------------------------------------------------------- */
 #define LSCANFD_SET_RTRLE	BIT(0)
 #define LSCANFD_SET_RTRTH	GENMASK(4, 1)
 #define LSCANFD_SET_ILBP	BIT(5)
 #define LSCANFD_SET_ENA		BIT(6)
 #define LSCANFD_SET_NISOFD	BIT(7)
 
-/* -------------------------------------------------------------------------
- * CR_STAT (Table 16-5)
- * ---------------------------------------------------------------------- */
 #define LSCANFD_STAT_RXNE	BIT(0)
 #define LSCANFD_STAT_DOR	BIT(1)
 #define LSCANFD_STAT_RXS	BIT(4)
@@ -98,9 +92,6 @@
 #define LSCANFD_STAT_EWL	BIT(6)
 #define LSCANFD_STAT_IDLE	BIT(7)
 
-/* -------------------------------------------------------------------------
- * CR_CMD (Table 16-6)
- * ---------------------------------------------------------------------- */
 #define LSCANFD_CMD_RXRPMV	BIT(1)
 #define LSCANFD_CMD_RRB		BIT(2)
 #define LSCANFD_CMD_CDO		BIT(3)
@@ -109,9 +100,7 @@
 #define LSCANFD_CMD_TXFCRST	BIT(6)
 #define LSCANFD_CMD_CPEXS	BIT(7)
 
-/* -------------------------------------------------------------------------
- * INT_STAT / INT_ENA / INT_MASK (Tables 16-7, 16-8, 16-9)
- * ---------------------------------------------------------------------- */
+/* INT_STAT / INT_ENA / INT_MASK */
 #define LSCANFD_INT_RXI		BIT(0)
 #define LSCANFD_INT_TXI		BIT(1)
 #define LSCANFD_INT_EWLI	BIT(2)
@@ -129,9 +118,7 @@
 #define LSCANFD_INT_ERRORI	(LSCANFD_INT_EWLI | LSCANFD_INT_FCSI | \
 				 LSCANFD_INT_ALI  | LSCANFD_INT_BEI)
 
-/* -------------------------------------------------------------------------
- * BTR_NORM / BTR_FD (Tables 16-10, 16-11)
- * ---------------------------------------------------------------------- */
+/* BTR_NORM / BTR_FD */
 #define LSCANFD_BTR_PROP	GENMASK(6, 0)
 #define LSCANFD_BTR_PH1		GENMASK(12, 7)
 #define LSCANFD_BTR_PH2		GENMASK(18, 13)
@@ -144,9 +131,7 @@
 #define LSCANFD_BTR_FD_BRP	GENMASK(26, 19)
 #define LSCANFD_BTR_FD_SJW	GENMASK(31, 27)
 
-/* -------------------------------------------------------------------------
- * FSTAT (Table 16-13), ERC (Table 16-14)
- * ---------------------------------------------------------------------- */
+/* FSTAT / ERC */
 #define LSCANFD_FSTAT_ERA	BIT(0)
 #define LSCANFD_FSTAT_ERP	BIT(1)
 #define LSCANFD_FSTAT_BOF	BIT(2)
@@ -155,22 +140,15 @@
 #define LSCANFD_ERC_TEC		GENMASK(8, 0)
 #define LSCANFD_ERC_REC		GENMASK(24, 16)
 
-/* -------------------------------------------------------------------------
- * RX_STAT (Table 16-39)
- * ---------------------------------------------------------------------- */
+/* RX_STAT / TX_STAT */
 #define LSCANFD_RX_STAT_RXE	BIT(0)
 #define LSCANFD_RX_STAT_RXF	BIT(1)
 #define LSCANFD_RX_STAT_RXFRC	GENMASK(14, 4)
 
-/* -------------------------------------------------------------------------
- * TX_STAT (Table 16-41)
- * ---------------------------------------------------------------------- */
 #define LSCANFD_TX_STAT_BRP	GENMASK(7, 0)
 #define LSCANFD_TX_STAT_BS	GENMASK(31, 16)
 
-/* -------------------------------------------------------------------------
- * TX_CMD (Table 16-42), TX_SEL (Table 16-43)
- * ---------------------------------------------------------------------- */
+/* TX_CMD / TX_SEL */
 #define LSCANFD_TX_CMD_BAR	GENMASK(7, 0)
 #define LSCANFD_TX_CMD_BCR	GENMASK(15, 8)
 #define LSCANFD_TX_CMD_BSC	GENMASK(23, 16)
@@ -178,9 +156,7 @@
 #define LSCANFD_TX_SEL_BUF_SEL	GENMASK(3, 0)
 #define LSCANFD_TX_SEL_BUF_CNT	GENMASK(7, 4)
 
-/* -------------------------------------------------------------------------
- * Frame format (Section 16.4)
- * ---------------------------------------------------------------------- */
+/* Frame format */
 #define LSCANFD_META0_ID_EXT	GENMASK(28, 0)
 #define LSCANFD_META0_ID_BASE	GENMASK(28, 18)
 #define LSCANFD_META0_RTR	BIT(29)
@@ -197,9 +173,7 @@
 #define LSCANFD_META1_OFF	0x4
 #define LSCANFD_DATA_OFF	0x8
 
-/* -------------------------------------------------------------------------
- * Driver constants
- * ---------------------------------------------------------------------- */
+/* Driver constants */
 #define LSCANFD_TXBUF_NUM	8
 #define LSCANFD_DRV_NAME	"loongson_canfd"
 #define LSCANFD_DEVICE_ID	0xBABE
@@ -208,8 +182,10 @@
 #define LSCANFD_RXDMA_PERIOD	SZ_4K
 #define LSCANFD_RXDMA_NUM	(LSCANFD_RXBUF_SZ / DMA_SLAVE_BUSWIDTH_4_BYTES)
 
-/* After this many consecutive invalid headers, give up and jump to wr_pos */
-#define LSCANFD_RX_BAD_LIMIT	64
+/* Safety net: max consecutive invalid headers before forcing a resync */
+#define LSCANFD_RX_BAD_LIMIT	32
+/* Max microseconds to wait for the DMA engine to deliver a header */
+#define LSCANFD_RXDMA_WAIT_US	100
 
 enum lscanfd_txtb_status {
 	LSCANFD_TXT_IDLE	= 0x0,
@@ -236,12 +212,9 @@ struct lscanfd_priv {
 	dma_cookie_t		rx_cookie;
 	dma_addr_t		rx_dma_buf;
 	unsigned int		*rx_buf;
+	bool			rx_dma_paused;
 
-	/*
-	 * RX positions are 64-bit monotonic counters in units of 32-bit
-	 * words.  rx_rd_pos is advanced by the parser, rx_wr_pos is derived
-	 * from the DMA residue and is extended across ring wraparounds.
-	 */
+	/* RX positions: 64-bit monotonic counters in 32-bit words */
 	u64			rx_rd_pos;
 	u64			rx_wr_pos;
 	u32			rx_wr_off;
@@ -391,7 +364,7 @@ static void lscanfd_disable_interrupts(struct lscanfd_priv *priv)
 }
 
 /* -------------------------------------------------------------------------
- * RX DMA: position tracking and data access
+ * RX DMA: pause / resume / position tracking
  * ---------------------------------------------------------------------- */
 static void lscanfd_rxdata_dma_free(struct lscanfd_priv *priv,
 				    struct device *dev)
@@ -406,10 +379,9 @@ static void lscanfd_rxdata_dma_free(struct lscanfd_priv *priv,
 
 /*
  * Turn the DMA residue into a raw ring offset, then extend it into a
- * 64-bit monotonic write position.  The DMA engine exposes the number of
- * bytes left in the whole cyclic run; the residue wraps back to the buffer
- * size right after the ring is filled, which is what tells us a wrap
- * happened.
+ * 64-bit monotonic write position.  The loongson2-cmc-dma residue covers
+ * the whole cyclic run, so an offset that decreases means the engine
+ * wrapped around.
  */
 static void lscanfd_dma_sync_wr(struct lscanfd_priv *priv)
 {
@@ -439,6 +411,51 @@ static void lscanfd_dma_sync_wr(struct lscanfd_priv *priv)
 	priv->rx_wr_off = off;
 }
 
+/*
+ * Pause the cyclic DMA engine.  Returns silently when the channel is
+ * already paused or when the controller does not implement device_pause;
+ * in the latter case the driver falls back to the legacy sliding logic.
+ */
+static void lscanfd_rxdma_pause(struct lscanfd_priv *priv)
+{
+	if (!priv->rx_ch || priv->rx_dma_paused)
+		return;
+
+	if (!dmaengine_pause(priv->rx_ch))
+		priv->rx_dma_paused = true;
+}
+
+static void lscanfd_rxdma_resume(struct lscanfd_priv *priv)
+{
+	if (!priv->rx_ch || !priv->rx_dma_paused)
+		return;
+
+	dmaengine_resume(priv->rx_ch);
+	priv->rx_dma_paused = false;
+}
+
+/*
+ * Wait until the DMA engine has copied at least one complete header
+ * (two 32-bit words) after a resume.  This avoids parsing the ring before
+ * the first transaction has landed.
+ *
+ * Return: 0 on success, -ETIMEDOUT if the engine made no progress.
+ */
+static int lscanfd_rxdma_wait_header(struct lscanfd_priv *priv)
+{
+	int i;
+
+	for (i = 0; i < LSCANFD_RXDMA_WAIT_US; i++) {
+		lscanfd_dma_sync_wr(priv);
+
+		if (priv->rx_wr_pos - priv->rx_rd_pos >= 2)
+			return 0;
+
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
 static u32 lscanfd_rxdata_dma(struct lscanfd_priv *priv)
 {
 	u32 idx = priv->rx_rd_pos % LSCANFD_RXDMA_NUM;
@@ -452,10 +469,6 @@ static u32 lscanfd_rxdata_poll(struct lscanfd_priv *priv)
 	return lscanfd_read32(priv, LSCANFD_RX_DATA);
 }
 
-/*
- * Non-DMA mode: FIFO is empty when both the frame counter is zero and the
- * RXE bit is set.
- */
 static bool lscanfd_rxbuf_is_empty(struct lscanfd_priv *priv)
 {
 	u32 rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
@@ -464,40 +477,6 @@ static bool lscanfd_rxbuf_is_empty(struct lscanfd_priv *priv)
 		return false;
 
 	return !!(rx_stat & LSCANFD_RX_STAT_RXE);
-}
-
-/*
- * DMA mode: keep going while the hardware FIFO still has frames, or while
- * the ring holds at least two header words.  When the FIFO is empty and a
- * stream of all-zero headers is already being skipped, stop immediately
- * instead of sliding word by word through DMA garbage.
- */
-static bool lscanfd_rxbuf_is_empty_dma(struct lscanfd_priv *priv)
-{
-	u32 rx_stat, framecnt;
-
-	lscanfd_dma_sync_wr(priv);
-
-	if (priv->rx_wr_pos < priv->rx_rd_pos)
-		return false;
-
-	rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
-	framecnt = FIELD_GET(LSCANFD_RX_STAT_RXFRC, rx_stat);
-
-	if (framecnt)
-		return false;
-
-	if ((rx_stat & LSCANFD_RX_STAT_RXE) &&
-	    priv->rx_bad_cnt >= LSCANFD_RX_BAD_LIMIT) {
-		priv->rx_rd_pos = priv->rx_wr_pos;
-		priv->rx_bad_cnt = 0;
-		return true;
-	}
-
-	if (priv->rx_wr_pos - priv->rx_rd_pos >= 2)
-		return false;
-
-	return true;
 }
 
 /* -------------------------------------------------------------------------
@@ -530,10 +509,9 @@ static int lscanfd_chip_start(struct net_device *ndev)
 		set |= LSCANFD_SET_NISOFD;
 	lscanfd_write32(priv, LSCANFD_CR_SET, set);
 
-	int_ena = LSCANFD_INT_TXBHCI | LSCANFD_INT_EWLI |
-		  LSCANFD_INT_FCSI;
+	int_ena = LSCANFD_INT_TXBHCI | LSCANFD_INT_EWLI | LSCANFD_INT_FCSI;
 	if (priv->rx_ch)
-		int_ena |= LSCANFD_INT_DMADI;
+		int_ena |= LSCANFD_INT_RBNEI | LSCANFD_INT_DMADI;
 	else
 		int_ena |= LSCANFD_INT_RBNEI;
 	if (priv->can.ctrlmode & CAN_CTRLMODE_BERR_REPORTING)
@@ -686,7 +664,12 @@ static void lscanfd_err_interrupt(struct net_device *ndev, u32 isr)
 }
 
 /* -------------------------------------------------------------------------
- * RX parser (shared between DMA and poll modes)
+ * RX parser
+ *
+ * With pause/resume active, the ring never accumulates idle zeroes, so
+ * this routine is mostly a plain frame decoder.  The zero-jump and
+ * single-word slide are kept as a safety net for the few words the DMA
+ * engine may copy between RXE assertion and CCR.EN clear.
  * ---------------------------------------------------------------------- */
 static int lscanfd_rx_one(struct net_device *ndev)
 {
@@ -715,8 +698,9 @@ static int lscanfd_rx_one(struct net_device *ndev)
 		avail = priv->rx_wr_pos - priv->rx_rd_pos;
 
 		/*
-		 * DMA overran the ring: the oldest words were overwritten
-		 * and cannot be trusted.  Jump to the newest data.
+		 * DMA overran the ring: the oldest words were overwritten.
+		 * This cannot happen while the channel is paused, but a
+		 * very long NAPI poll could still race with the engine.
 		 */
 		if (avail > LSCANFD_RXDMA_NUM) {
 			stats->rx_errors++;
@@ -740,10 +724,10 @@ static int lscanfd_rx_one(struct net_device *ndev)
 
 		if (priv->rx_ch) {
 			/*
-			 * All-zero header with RXE=1 means the DMA engine
-			 * copied the idle value of RX_DATA.  Everything
-			 * between here and wr_pos is garbage; jump over it
-			 * in one shot instead of sliding word by word.
+			 * All-zero header with RXE=1: this is the idle value
+			 * of RX_DATA that the DMA engine copied before the
+			 * pause took effect.  Everything from here to wr_pos
+			 * is garbage.
 			 */
 			if ((rx_stat & LSCANFD_RX_STAT_RXE) &&
 			    meta0 == 0 && meta1 == 0) {
@@ -752,7 +736,19 @@ static int lscanfd_rx_one(struct net_device *ndev)
 				return -ENODATA;
 			}
 
-			/* Slide one word so a real header can realign */
+			/*
+			 * While the channel is paused, wr_pos is frozen;
+			 * any 2-word window that is not a valid header is
+			 * necessarily garbage, so we can jump straight to
+			 * the end of the ring.
+			 */
+			if (priv->rx_dma_paused) {
+				priv->rx_rd_pos = priv->rx_wr_pos;
+				priv->rx_bad_cnt = 0;
+				return -ENODATA;
+			}
+
+			/* Last-resort slide while the engine is running */
 			priv->rx_rd_pos = saved_rd_pos + 1;
 			if (++priv->rx_bad_cnt >= LSCANFD_RX_BAD_LIMIT) {
 				priv->rx_rd_pos = priv->rx_wr_pos;
@@ -772,9 +768,9 @@ static int lscanfd_rx_one(struct net_device *ndev)
 	dlc = FIELD_GET(LSCANFD_META1_DLC, meta1);
 
 	/*
-	 * Re-check the DMA position: it may have advanced while the header
-	 * words were being parsed.  If the payload is not fully resident,
-	 * roll the read position back and let NAPI retry.
+	 * Re-check the DMA position: while running, the engine may have
+	 * advanced between header read and payload read.  When paused,
+	 * wr_pos is frozen, so the check below is effectively a no-op.
 	 */
 	if (priv->rx_ch) {
 		lscanfd_dma_sync_wr(priv);
@@ -796,6 +792,11 @@ static int lscanfd_rx_one(struct net_device *ndev)
 		skb = alloc_can_skb(ndev, (struct can_frame **)&cf);
 	if (unlikely(!skb)) {
 		if (priv->rx_ch) {
+			if (priv->rx_dma_paused) {
+				priv->rx_rd_pos = priv->rx_wr_pos;
+				priv->rx_bad_cnt = 0;
+				return -ENODATA;
+			}
 			priv->rx_rd_pos = saved_rd_pos + 1;
 			if (++priv->rx_bad_cnt >= LSCANFD_RX_BAD_LIMIT) {
 				priv->rx_rd_pos = priv->rx_wr_pos;
@@ -845,44 +846,90 @@ static int lscanfd_rx_one(struct net_device *ndev)
 	return 1;
 }
 
+/* -------------------------------------------------------------------------
+ * NAPI poll: FIFO-driven pause/resume
+ *
+ * The invariant is that the DMA channel is running exactly while the
+ * hardware FIFO has at least one frame.  Whenever RXFRC drops to zero the
+ * engine is paused, the ring is drained, and NAPI is allowed to complete.
+ * RBNEI then restarts the engine on the next frame.
+ * ---------------------------------------------------------------------- */
 static int lscanfd_rx_poll(struct napi_struct *napi, int quota)
 {
 	struct net_device *ndev = napi->dev;
 	struct lscanfd_priv *priv = netdev_priv(ndev);
 	struct net_device_stats *stats = &ndev->stats;
 	int work_done = 0;
-	u32 rx_stat;
+	u32 rx_stat, framecnt;
 	int eagain = 0;
+	int ret;
 
 	while (work_done < quota) {
-		if (priv->rxbuf_is_empty(priv))
-			break;
+		rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
+		framecnt = FIELD_GET(LSCANFD_RX_STAT_RXFRC, rx_stat);
 
-		switch (lscanfd_rx_one(ndev)) {
-		case -EAGAIN:
+		if (!framecnt) {
 			/*
-			 * FIFO still has frames but DMA has not copied the
-			 * payload yet.  Yield briefly, then retry a bounded
-			 * number of times.
+			 * FIFO empty: freeze the DMA engine so it stops
+			 * copying the idle value of RX_DATA into the ring.
+			 * Re-sync the write position once to account for
+			 * the words that landed before CCR.EN was cleared.
+			 */
+			if (priv->rx_ch) {
+				lscanfd_rxdma_pause(priv);
+				lscanfd_dma_sync_wr(priv);
+			}
+
+			/*
+			 * Drain the remaining frames.  With the engine
+			 * paused the ring is frozen, so any short tail is
+			 * pure garbage and the parser will jump over it.
+			 */
+			while (work_done < quota) {
+				ret = lscanfd_rx_one(ndev);
+				if (ret <= 0)
+					break;
+				work_done++;
+			}
+			break;
+		}
+
+		/*
+		 * FIFO has frames: make sure the engine is running before
+		 * asking it for data, and give it a moment to deliver the
+		 * first header of the new batch.
+		 */
+		if (priv->rx_ch && priv->rx_dma_paused) {
+			lscanfd_rxdma_resume(priv);
+			if (lscanfd_rxdma_wait_header(priv) < 0)
+				break;
+		}
+
+		ret = lscanfd_rx_one(ndev);
+		if (ret == -EAGAIN) {
+			/*
+			 * FIFO has frames but the DMA copy has not caught
+			 * up yet.  Yield briefly and retry a bounded number
+			 * of times.
 			 */
 			if (priv->rx_ch)
 				udelay(1);
 			if (++eagain > 1000)
-				goto out;
+				break;
 			continue;
-		case -ENODATA:
-			goto out;
-		case 1:
-			work_done++;
-			eagain = 0;
-			break;
-		default:
-			eagain = 0;
-			break;
 		}
+		if (ret == -ENODATA)
+			break;
+		if (ret < 0)
+			break;
+		if (ret == 0) {
+			eagain = 0;
+			continue;
+		}
+		eagain = 0;
+		work_done++;
 	}
 
-out:
 	/* Overrun: clear DOR and report */
 	rx_stat = lscanfd_read32(priv, LSCANFD_CR_STAT);
 	if (rx_stat & LSCANFD_STAT_DOR) {
@@ -892,6 +939,8 @@ out:
 		lscanfd_write32(priv, LSCANFD_CR_CMD, LSCANFD_CMD_CDO);
 		stats->rx_over_errors++;
 		stats->rx_errors++;
+
+		netdev_warn(ndev, "RX overflow\n");
 
 		skb = alloc_can_err_skb(ndev, &cf);
 		if (skb) {
@@ -903,8 +952,17 @@ out:
 		}
 	}
 
+	/*
+	 * Before completing NAPI, make sure the engine is paused while
+	 * the FIFO is empty, so RBNEI can drive the next resume.
+	 */
+	rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
+	framecnt = FIELD_GET(LSCANFD_RX_STAT_RXFRC, rx_stat);
+	if (priv->rx_ch && !framecnt)
+		lscanfd_rxdma_pause(priv);
+
 	if (napi_complete_done(napi, work_done)) {
-		u32 irq = priv->rx_ch ? LSCANFD_INT_DMADI
+		u32 irq = priv->rx_ch ? LSCANFD_INT_RBNEI
 				      : LSCANFD_INT_RBNEI;
 
 		lscanfd_int_mask(priv, irq);
@@ -1078,6 +1136,11 @@ static void lscanfd_tx_interrupt(struct net_device *ndev)
 
 /* -------------------------------------------------------------------------
  * IRQ handler
+ *
+ * RBNEI fires whenever the FIFO becomes non-empty.  We deliberately do not
+ * resume the DMA engine here; the resume is done inside NAPI so the engine
+ * runs only while the CPU is about to consume data, keeping the ring free
+ * of idle zeroes between bursts.
  * ---------------------------------------------------------------------- */
 static irqreturn_t lscanfd_interrupt(int irq, void *dev_id)
 {
@@ -1152,7 +1215,7 @@ static int lscanfd_rxdma_init(struct net_device *ndev)
 	config.src_maxburst = 1;
 	config.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
 	config.dst_maxburst = 1;
-	config.device_fc = false;	/* DMA engine is the flow controller */
+	config.device_fc = false;
 
 	ret = dmaengine_slave_config(priv->rx_ch, &config);
 	if (ret < 0) {
@@ -1195,11 +1258,11 @@ static int lscanfd_rxdma_start(struct net_device *ndev)
 		return -EIO;
 	}
 
-	/* Cyclic descriptor always starts at ring offset 0 */
 	priv->rx_rd_pos = 0;
 	priv->rx_wr_pos = 0;
 	priv->rx_wr_off = 0;
 	priv->rx_bad_cnt = 0;
+	priv->rx_dma_paused = false;
 
 	dma_async_issue_pending(priv->rx_ch);
 	return 0;
@@ -1210,6 +1273,8 @@ static void lscanfd_rxdma_stop(struct lscanfd_priv *priv)
 	if (!priv->rx_ch)
 		return;
 
+	/* Never leave the channel paused when tearing it down */
+	lscanfd_rxdma_resume(priv);
 	dmaengine_terminate_sync(priv->rx_ch);
 }
 
@@ -1218,7 +1283,7 @@ static void lscanfd_rxdma_remove(struct lscanfd_priv *priv, struct device *dev)
 	if (!priv->rx_ch)
 		return;
 
-	dmaengine_terminate_sync(priv->rx_ch);
+	lscanfd_rxdma_stop(priv);
 	lscanfd_rxdata_dma_free(priv, dev);
 	dma_release_channel(priv->rx_ch);
 	priv->rx_ch = NULL;
@@ -1305,7 +1370,7 @@ static int lscanfd_open(struct net_device *ndev)
 	napi_enable(&priv->napi);
 
 	/*
-	 * Start the DMA engine before the controller: as soon as the
+	 * Start the DMA engine before the controller.  As soon as the
 	 * controller starts pushing data into RX_DATA, the DMA must
 	 * already be ready to consume it.
 	 */
@@ -1342,9 +1407,9 @@ static int lscanfd_close(struct net_device *ndev)
 
 	/*
 	 * Stop the controller (the data source) first, then the DMA
-	 * engine (the mover).  The reverse order would leave the DMA
-	 * reading an undefined RX_DATA while the controller is being
-	 * torn down.
+	 * engine (the mover).  lscanfd_rxdma_stop() resumes the
+	 * channel before terminating it so the engine never blocks
+	 * inside dmaengine_terminate_sync() in the paused state.
 	 */
 	lscanfd_chip_stop(ndev);
 	lscanfd_rxdma_stop(priv);
@@ -1430,18 +1495,21 @@ static int lscanfd_probe(struct platform_device *pdev)
 
 	lscanfd_reset(priv);
 
-	/*
-	 * Try to set up RX DMA.  Any failure is not fatal: the driver
-	 * falls back to FIFO polling, which is slower but always works.
-	 */
 	priv->get_rx_data = lscanfd_rxdata_poll;
 	priv->rxbuf_is_empty = lscanfd_rxbuf_is_empty;
+	priv->rx_dma_paused = false;
 
 	if (!dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
 		ret = lscanfd_rxdma_init(ndev);
 		if (!ret) {
 			priv->get_rx_data = lscanfd_rxdata_dma;
-			priv->rxbuf_is_empty = lscanfd_rxbuf_is_empty_dma;
+			/*
+			 * The DMA-mode empty predicate is only used by
+			 * legacy paths; NAPI now drives the decision via
+			 * RXFRC and pause/resume, but keep the pointer
+			 * valid to avoid NULL dereferences in future code.
+			 */
+			priv->rxbuf_is_empty = lscanfd_rxbuf_is_empty;
 		} else if (ret != -EPROBE_DEFER) {
 			dev_warn(dev,
 				 "RX DMA unavailable (%d), falling back to poll\n",
@@ -1503,5 +1571,5 @@ static struct platform_driver lscanfd_driver = {
 module_platform_driver(lscanfd_driver);
 
 MODULE_AUTHOR("Loongson Technology Corporation Limited");
-MODULE_DESCRIPTION("Loongson 2K3000 CAN-FD controller driver with RX DMA");
+MODULE_DESCRIPTION("Loongson 2K3000 CAN-FD controller driver with RX DMA pause/resume");
 MODULE_LICENSE("GPL");
