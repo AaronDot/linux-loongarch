@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Loongson 2K3000 CAN-FD controller driver
+ * Loongson 2K3000 CAN-FD controller driver with RX DMA support
  *
  * Copyright (C) 2024-2026 Loongson Technology Corporation Limited
  *
- * Register definitions are taken from the LS2K3000/3B6000M user manual,
- * chapter 16 (CAN). The driver architecture follows the community
- * ctucanfd driver: a single NAPI poll routine, multi-buffer TX rotation
- * over eight hardware TX buffers, and error-frame generation driven by
- * FCSI/EWLI/ALI/BEI interrupts.
+ * RX DMA uses the loongson2-cmc-dma controller in cyclic mode: the DMA
+ * engine copies 32-bit words from LSCANFD_RX_DATA into a 32 KB ring buffer
+ * in 4 KB periods.  The CPU reconstructs the write position from the DMA
+ * residue and parses frames out of the ring.  When the hardware FIFO is
+ * empty the DMA engine keeps reading RX_DATA (which returns zero); the
+ * driver detects all-zero headers with RXE=1 and jumps the read pointer
+ * onto the current write position instead of sliding word by word.
  */
 
 #include <linux/acpi.h>
+#include <linux/acpi_dma.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/can/dev.h>
 #include <linux/can/error.h>
 #include <linux/clk.h>
+#include <linux/dma-direction.h>
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
 #include <linux/errno.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -58,7 +64,7 @@
 #define LSCANFD_TX_STAT		0x9c
 #define LSCANFD_TX_CMD		0xa0
 #define LSCANFD_TX_SEL		0xa4
-#define LSCANFD_TX_DATA		0xb0	/* 0xb0 .. 0xf4, one TX buffer */
+#define LSCANFD_TX_DATA		0xb0
 
 /* -------------------------------------------------------------------------
  * CR_MODE (Table 16-3)
@@ -105,10 +111,6 @@
 
 /* -------------------------------------------------------------------------
  * INT_STAT / INT_ENA / INT_MASK (Tables 16-7, 16-8, 16-9)
- *
- * Both INT_ENA and INT_MASK follow the same layout:
- *   bits[12:0]  set enable / set mask (write 1)
- *   bits[28:16] clear enable / clear mask (write 1)
  * ---------------------------------------------------------------------- */
 #define LSCANFD_INT_RXI		BIT(0)
 #define LSCANFD_INT_TXI		BIT(1)
@@ -202,6 +204,13 @@
 #define LSCANFD_DRV_NAME	"loongson_canfd"
 #define LSCANFD_DEVICE_ID	0xBABE
 
+#define LSCANFD_RXBUF_SZ	SZ_32K
+#define LSCANFD_RXDMA_PERIOD	SZ_4K
+#define LSCANFD_RXDMA_NUM	(LSCANFD_RXBUF_SZ / DMA_SLAVE_BUSWIDTH_4_BYTES)
+
+/* After this many consecutive invalid headers, give up and jump to wr_pos */
+#define LSCANFD_RX_BAD_LIMIT	64
+
 enum lscanfd_txtb_status {
 	LSCANFD_TXT_IDLE	= 0x0,
 	LSCANFD_TXT_VALID	= 0x1,
@@ -209,26 +218,38 @@ enum lscanfd_txtb_status {
 	LSCANFD_TXT_CANCEL	= 0x3,
 };
 
-enum lscanfd_txtb_cmd {
-	LSCANFD_TXT_CMD_ADD	= 0x01,
-	LSCANFD_TXT_CMD_CANCEL	= 0x02,
-	LSCANFD_TXT_CMD_SR_CLEAN = 0x03,
-};
-
 struct lscanfd_priv {
 	struct can_priv		can;		/* must be first */
 	struct napi_struct	napi;
 	void __iomem		*base;
+	phys_addr_t		phys_base;
 	int			irq;
 	u32			clk_rate;
 
-	/* TX buffer rotation (ctucanfd style) */
+	/* TX buffer rotation */
 	unsigned int		txb_head;
 	unsigned int		txb_tail;
 	spinlock_t		tx_lock;
 
-	/* RX statistics helper */
-	u32			rx_dropped;
+	/* RX DMA */
+	struct dma_chan		*rx_ch;
+	dma_cookie_t		rx_cookie;
+	dma_addr_t		rx_dma_buf;
+	unsigned int		*rx_buf;
+
+	/*
+	 * RX positions are 64-bit monotonic counters in units of 32-bit
+	 * words.  rx_rd_pos is advanced by the parser, rx_wr_pos is derived
+	 * from the DMA residue and is extended across ring wraparounds.
+	 */
+	u64			rx_rd_pos;
+	u64			rx_wr_pos;
+	u32			rx_wr_off;
+	u32			rx_bad_cnt;
+
+	/* Mode-dependent accessors */
+	u32 (*get_rx_data)(struct lscanfd_priv *priv);
+	bool (*rxbuf_is_empty)(struct lscanfd_priv *priv);
 };
 
 static inline u32 lscanfd_read32(struct lscanfd_priv *priv, u32 reg)
@@ -292,11 +313,6 @@ static bool lscanfd_enabled(struct lscanfd_priv *priv)
 	return !!(lscanfd_read32(priv, LSCANFD_CR_SET) & LSCANFD_SET_ENA);
 }
 
-/*
- * The hardware PROP field is wider than PH1.  The kernel splits tseg1 in
- * half between prop_seg and phase_seg1; if phase_seg1 overflows the PH1
- * field, push the surplus into prop_seg.
- */
 static void lscanfd_set_btr(struct lscanfd_priv *priv,
 			    struct can_bittiming *bt, bool nominal)
 {
@@ -330,12 +346,8 @@ static void lscanfd_set_btr(struct lscanfd_priv *priv,
 
 static void lscanfd_set_ssp(struct lscanfd_priv *priv)
 {
-	u32 cfg = 0;
+	u32 cfg;
 
-	/*
-	 * SSP_CFG[SSP_SRC] = 0b01 disables SSP.  The kernel only uses TDC
-	 * for data rates above 1 Mbps; otherwise leave SSP disabled.
-	 */
 	if (can_fd_tdc_is_enabled(&priv->can))
 		cfg = FIELD_PREP(GENMASK(9, 8), 0x0) |
 		      FIELD_PREP(GENMASK(7, 0), priv->can.fd.tdc.tdco);
@@ -360,22 +372,8 @@ static void lscanfd_set_data_bittiming(struct net_device *ndev)
 }
 
 /* -------------------------------------------------------------------------
- * Interrupt mask helpers.
- *
- * INT_ENA/INT_MASK use a "write-1-set" on bits[12:0] and "write-1-clear" on
- * bits[28:16].  The helpers below always clear then set, so they are safe
- * to call from any context.
+ * Interrupt mask helpers
  * ---------------------------------------------------------------------- */
-static void lscanfd_int_enable(struct lscanfd_priv *priv, u32 mask)
-{
-	lscanfd_write32(priv, LSCANFD_INT_ENA, mask);
-}
-
-static void lscanfd_int_disable(struct lscanfd_priv *priv, u32 mask)
-{
-	lscanfd_write32(priv, LSCANFD_INT_ENA, mask << 16);
-}
-
 static void lscanfd_int_mask(struct lscanfd_priv *priv, u32 mask)
 {
 	lscanfd_write32(priv, LSCANFD_INT_MASK, mask);
@@ -393,6 +391,116 @@ static void lscanfd_disable_interrupts(struct lscanfd_priv *priv)
 }
 
 /* -------------------------------------------------------------------------
+ * RX DMA: position tracking and data access
+ * ---------------------------------------------------------------------- */
+static void lscanfd_rxdata_dma_free(struct lscanfd_priv *priv,
+				    struct device *dev)
+{
+	if (!priv->rx_buf)
+		return;
+
+	dma_free_coherent(dev, LSCANFD_RXBUF_SZ, priv->rx_buf,
+			  priv->rx_dma_buf);
+	priv->rx_buf = NULL;
+}
+
+/*
+ * Turn the DMA residue into a raw ring offset, then extend it into a
+ * 64-bit monotonic write position.  The DMA engine exposes the number of
+ * bytes left in the whole cyclic run; the residue wraps back to the buffer
+ * size right after the ring is filled, which is what tells us a wrap
+ * happened.
+ */
+static void lscanfd_dma_sync_wr(struct lscanfd_priv *priv)
+{
+	struct dma_tx_state state;
+	u32 off;
+
+	if (!priv->rx_ch)
+		return;
+
+	if (dmaengine_tx_status(priv->rx_ch, priv->rx_cookie, &state) !=
+	    DMA_IN_PROGRESS)
+		return;
+
+	if (state.residue > LSCANFD_RXBUF_SZ)
+		state.residue = LSCANFD_RXBUF_SZ;
+
+	off = (LSCANFD_RXBUF_SZ - state.residue) /
+	      DMA_SLAVE_BUSWIDTH_4_BYTES;
+	off %= LSCANFD_RXDMA_NUM;
+
+	if (off < priv->rx_wr_off)
+		priv->rx_wr_pos += LSCANFD_RXDMA_NUM -
+				   priv->rx_wr_off + off;
+	else
+		priv->rx_wr_pos += off - priv->rx_wr_off;
+
+	priv->rx_wr_off = off;
+}
+
+static u32 lscanfd_rxdata_dma(struct lscanfd_priv *priv)
+{
+	u32 idx = priv->rx_rd_pos % LSCANFD_RXDMA_NUM;
+
+	priv->rx_rd_pos++;
+	return priv->rx_buf[idx];
+}
+
+static u32 lscanfd_rxdata_poll(struct lscanfd_priv *priv)
+{
+	return lscanfd_read32(priv, LSCANFD_RX_DATA);
+}
+
+/*
+ * Non-DMA mode: FIFO is empty when both the frame counter is zero and the
+ * RXE bit is set.
+ */
+static bool lscanfd_rxbuf_is_empty(struct lscanfd_priv *priv)
+{
+	u32 rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
+
+	if (FIELD_GET(LSCANFD_RX_STAT_RXFRC, rx_stat))
+		return false;
+
+	return !!(rx_stat & LSCANFD_RX_STAT_RXE);
+}
+
+/*
+ * DMA mode: keep going while the hardware FIFO still has frames, or while
+ * the ring holds at least two header words.  When the FIFO is empty and a
+ * stream of all-zero headers is already being skipped, stop immediately
+ * instead of sliding word by word through DMA garbage.
+ */
+static bool lscanfd_rxbuf_is_empty_dma(struct lscanfd_priv *priv)
+{
+	u32 rx_stat, framecnt;
+
+	lscanfd_dma_sync_wr(priv);
+
+	if (priv->rx_wr_pos < priv->rx_rd_pos)
+		return false;
+
+	rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
+	framecnt = FIELD_GET(LSCANFD_RX_STAT_RXFRC, rx_stat);
+
+	if (framecnt)
+		return false;
+
+	if ((rx_stat & LSCANFD_RX_STAT_RXE) &&
+	    priv->rx_bad_cnt >= LSCANFD_RX_BAD_LIMIT) {
+		priv->rx_rd_pos = priv->rx_wr_pos;
+		priv->rx_bad_cnt = 0;
+		return true;
+	}
+
+	if (priv->rx_wr_pos - priv->rx_rd_pos >= 2)
+		return false;
+
+	return true;
+}
+
+/* -------------------------------------------------------------------------
  * Chip start / stop
  * ---------------------------------------------------------------------- */
 static int lscanfd_chip_start(struct net_device *ndev)
@@ -404,7 +512,6 @@ static int lscanfd_chip_start(struct net_device *ndev)
 	lscanfd_set_data_bittiming(ndev);
 	lscanfd_set_ssp(priv);
 
-	/* CR_MODE */
 	mode |= LSCANFD_MODE_ITSM | LSCANFD_MODE_RXBAM | LSCANFD_MODE_BUFM;
 	if (priv->can.ctrlmode & CAN_CTRLMODE_LISTENONLY)
 		mode |= LSCANFD_MODE_BMM;
@@ -414,7 +521,6 @@ static int lscanfd_chip_start(struct net_device *ndev)
 		mode |= LSCANFD_MODE_ACF;
 	lscanfd_write32(priv, LSCANFD_CR_MODE, mode);
 
-	/* CR_SET */
 	set |= LSCANFD_SET_RTRLE;
 	if (priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT)
 		set |= FIELD_PREP(LSCANFD_SET_RTRTH, 0xf);
@@ -424,22 +530,23 @@ static int lscanfd_chip_start(struct net_device *ndev)
 		set |= LSCANFD_SET_NISOFD;
 	lscanfd_write32(priv, LSCANFD_CR_SET, set);
 
-	/* Interrupts */
 	int_ena = LSCANFD_INT_TXBHCI | LSCANFD_INT_EWLI |
-		  LSCANFD_INT_FCSI  | LSCANFD_INT_RBNEI;
+		  LSCANFD_INT_FCSI;
+	if (priv->rx_ch)
+		int_ena |= LSCANFD_INT_DMADI;
+	else
+		int_ena |= LSCANFD_INT_RBNEI;
 	if (priv->can.ctrlmode & CAN_CTRLMODE_BERR_REPORTING)
 		int_ena |= LSCANFD_INT_ALI | LSCANFD_INT_BEI;
 
-	lscanfd_write32(priv, LSCANFD_INT_MASK, 0x1fff);	/* mask all */
-	lscanfd_write32(priv, LSCANFD_INT_ENA, 0x1fff << 16);	/* disable all */
-	lscanfd_write32(priv, LSCANFD_INT_MASK, int_ena << 16);	/* unmask used */
-	lscanfd_write32(priv, LSCANFD_INT_ENA, int_ena);	/* enable used */
+	lscanfd_write32(priv, LSCANFD_INT_MASK, 0x1fff);
+	lscanfd_write32(priv, LSCANFD_INT_ENA, 0x1fff << 16);
+	lscanfd_write32(priv, LSCANFD_INT_MASK, int_ena << 16);
+	lscanfd_write32(priv, LSCANFD_INT_ENA, int_ena);
 
 	priv->can.state = CAN_STATE_ERROR_ACTIVE;
 
-	/* Enable controller last */
 	lscanfd_write32(priv, LSCANFD_CR_SET, set | LSCANFD_SET_ENA);
-
 	return 0;
 }
 
@@ -579,7 +686,7 @@ static void lscanfd_err_interrupt(struct net_device *ndev, u32 isr)
 }
 
 /* -------------------------------------------------------------------------
- * RX path
+ * RX parser (shared between DMA and poll modes)
  * ---------------------------------------------------------------------- */
 static int lscanfd_rx_one(struct net_device *ndev)
 {
@@ -587,34 +694,120 @@ static int lscanfd_rx_one(struct net_device *ndev)
 	struct net_device_stats *stats = &ndev->stats;
 	struct canfd_frame *cf;
 	struct sk_buff *skb;
-	u32 meta0, meta1, rwcnt, dlc;
+	u32 meta0, meta1, rwcnt, dlc, rx_stat;
 	bool is_fd;
+	u64 saved_rd_pos = priv->rx_rd_pos;
+	u64 avail;
 	u32 i;
 
-	meta0 = lscanfd_read32(priv, LSCANFD_RX_DATA);
-	meta1 = lscanfd_read32(priv, LSCANFD_RX_DATA);
+	if (priv->rx_ch) {
+		lscanfd_dma_sync_wr(priv);
+
+		if (priv->rx_wr_pos < priv->rx_rd_pos) {
+			netdev_warn(ndev,
+				    "RX pointer inversion: rd=%llu wr=%llu\n",
+				    priv->rx_rd_pos, priv->rx_wr_pos);
+			priv->rx_rd_pos = priv->rx_wr_pos;
+			priv->rx_bad_cnt = 0;
+			return 0;
+		}
+
+		avail = priv->rx_wr_pos - priv->rx_rd_pos;
+
+		/*
+		 * DMA overran the ring: the oldest words were overwritten
+		 * and cannot be trusted.  Jump to the newest data.
+		 */
+		if (avail > LSCANFD_RXDMA_NUM) {
+			stats->rx_errors++;
+			stats->rx_over_errors++;
+			priv->rx_rd_pos = priv->rx_wr_pos;
+			priv->rx_bad_cnt = 0;
+			return 0;
+		}
+
+		if (avail < 2)
+			return -EAGAIN;
+	}
+
+	meta0 = priv->get_rx_data(priv);
+	meta1 = priv->get_rx_data(priv);
 
 	rwcnt = FIELD_GET(LSCANFD_META1_RWCNT, meta1);
 	if (rwcnt < 2 || rwcnt > 18) {
-		/* Malformed header: drain and drop */
-		for (i = 2; i < rwcnt && i < 18; i++)
-			lscanfd_read32(priv, LSCANFD_RX_DATA);
+		rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
 		stats->rx_dropped++;
-		return -EINVAL;
+
+		if (priv->rx_ch) {
+			/*
+			 * All-zero header with RXE=1 means the DMA engine
+			 * copied the idle value of RX_DATA.  Everything
+			 * between here and wr_pos is garbage; jump over it
+			 * in one shot instead of sliding word by word.
+			 */
+			if ((rx_stat & LSCANFD_RX_STAT_RXE) &&
+			    meta0 == 0 && meta1 == 0) {
+				priv->rx_rd_pos = priv->rx_wr_pos;
+				priv->rx_bad_cnt = 0;
+				return -ENODATA;
+			}
+
+			/* Slide one word so a real header can realign */
+			priv->rx_rd_pos = saved_rd_pos + 1;
+			if (++priv->rx_bad_cnt >= LSCANFD_RX_BAD_LIMIT) {
+				priv->rx_rd_pos = priv->rx_wr_pos;
+				priv->rx_bad_cnt = 0;
+				return -ENODATA;
+			}
+		} else {
+			for (i = 2; i < rwcnt && i < 18; i++)
+				lscanfd_read32(priv, LSCANFD_RX_DATA);
+		}
+		return 1;
 	}
+
+	priv->rx_bad_cnt = 0;
 
 	is_fd = !!(meta1 & LSCANFD_META1_FDF);
 	dlc = FIELD_GET(LSCANFD_META1_DLC, meta1);
+
+	/*
+	 * Re-check the DMA position: it may have advanced while the header
+	 * words were being parsed.  If the payload is not fully resident,
+	 * roll the read position back and let NAPI retry.
+	 */
+	if (priv->rx_ch) {
+		lscanfd_dma_sync_wr(priv);
+
+		if (priv->rx_wr_pos < priv->rx_rd_pos) {
+			priv->rx_rd_pos = priv->rx_wr_pos;
+			return 0;
+		}
+
+		if (priv->rx_wr_pos - priv->rx_rd_pos < rwcnt - 2) {
+			priv->rx_rd_pos = saved_rd_pos;
+			return -EAGAIN;
+		}
+	}
 
 	if (is_fd)
 		skb = alloc_canfd_skb(ndev, &cf);
 	else
 		skb = alloc_can_skb(ndev, (struct can_frame **)&cf);
 	if (unlikely(!skb)) {
-		for (i = 2; i < rwcnt; i++)
-			lscanfd_read32(priv, LSCANFD_RX_DATA);
+		if (priv->rx_ch) {
+			priv->rx_rd_pos = saved_rd_pos + 1;
+			if (++priv->rx_bad_cnt >= LSCANFD_RX_BAD_LIMIT) {
+				priv->rx_rd_pos = priv->rx_wr_pos;
+				priv->rx_bad_cnt = 0;
+				return -ENODATA;
+			}
+		} else {
+			for (i = 2; i < rwcnt; i++)
+				lscanfd_read32(priv, LSCANFD_RX_DATA);
+		}
 		stats->rx_dropped++;
-		return -ENOMEM;
+		return 1;
 	}
 
 	if (meta0 & LSCANFD_META0_XDT)
@@ -640,7 +833,7 @@ static int lscanfd_rx_one(struct net_device *ndev)
 				     priv->can.ctrlmode);
 
 	for (i = 2; i < rwcnt; i++) {
-		u32 data = lscanfd_read32(priv, LSCANFD_RX_DATA);
+		u32 data = priv->get_rx_data(priv);
 
 		put_unaligned_le32(data, cf->data + (i - 2) * 4);
 	}
@@ -649,7 +842,7 @@ static int lscanfd_rx_one(struct net_device *ndev)
 		stats->rx_bytes += cf->len;
 	stats->rx_packets++;
 	netif_receive_skb(skb);
-	return 0;
+	return 1;
 }
 
 static int lscanfd_rx_poll(struct napi_struct *napi, int quota)
@@ -658,22 +851,39 @@ static int lscanfd_rx_poll(struct napi_struct *napi, int quota)
 	struct lscanfd_priv *priv = netdev_priv(ndev);
 	struct net_device_stats *stats = &ndev->stats;
 	int work_done = 0;
-	u32 rx_stat, framecnt;
+	u32 rx_stat;
+	int eagain = 0;
 
 	while (work_done < quota) {
-		rx_stat = lscanfd_read32(priv, LSCANFD_RX_STAT);
-		framecnt = FIELD_GET(LSCANFD_RX_STAT_RXFRC, rx_stat);
-
-		if (!framecnt)
+		if (priv->rxbuf_is_empty(priv))
 			break;
 
-		if (lscanfd_rx_one(ndev) < 0)
+		switch (lscanfd_rx_one(ndev)) {
+		case -EAGAIN:
+			/*
+			 * FIFO still has frames but DMA has not copied the
+			 * payload yet.  Yield briefly, then retry a bounded
+			 * number of times.
+			 */
+			if (priv->rx_ch)
+				udelay(1);
+			if (++eagain > 1000)
+				goto out;
+			continue;
+		case -ENODATA:
+			goto out;
+		case 1:
+			work_done++;
+			eagain = 0;
 			break;
-
-		work_done++;
+		default:
+			eagain = 0;
+			break;
+		}
 	}
 
-	/* Overrun: clear DOR, then release RX buffer if needed */
+out:
+	/* Overrun: clear DOR and report */
 	rx_stat = lscanfd_read32(priv, LSCANFD_CR_STAT);
 	if (rx_stat & LSCANFD_STAT_DOR) {
 		struct can_frame *cf;
@@ -693,12 +903,12 @@ static int lscanfd_rx_poll(struct napi_struct *napi, int quota)
 		}
 	}
 
-	if (work_done < quota) {
-		if (napi_complete_done(napi, work_done)) {
-			/* Level-triggered; safe to unmask now */
-			lscanfd_int_mask(priv, LSCANFD_INT_RBNEI);
-			lscanfd_int_unmask(priv, LSCANFD_INT_RBNEI);
-		}
+	if (napi_complete_done(napi, work_done)) {
+		u32 irq = priv->rx_ch ? LSCANFD_INT_DMADI
+				      : LSCANFD_INT_RBNEI;
+
+		lscanfd_int_mask(priv, irq);
+		lscanfd_int_unmask(priv, irq);
 	}
 
 	return work_done;
@@ -711,11 +921,9 @@ static bool lscanfd_txbuf_writable(struct lscanfd_priv *priv, u8 buf)
 {
 	u32 tx_stat = lscanfd_read32(priv, LSCANFD_TX_STAT);
 
-	/* BRP bit set => buffer pending or not yet added */
 	if (FIELD_GET(LSCANFD_TX_STAT_BRP, tx_stat) & BIT(buf))
 		return false;
 
-	/* BS state must be IDLE */
 	if ((FIELD_GET(LSCANFD_TX_STAT_BS, tx_stat) >> (buf * 2)) & 0x3)
 		return false;
 
@@ -728,10 +936,7 @@ static bool lscanfd_insert_frame(struct lscanfd_priv *priv,
 	u32 meta0 = 0, meta1 = 0;
 	u32 i;
 
-	if (buf >= LSCANFD_TXBUF_NUM)
-		return false;
-
-	if (!lscanfd_txbuf_writable(priv, buf))
+	if (buf >= LSCANFD_TXBUF_NUM || !lscanfd_txbuf_writable(priv, buf))
 		return false;
 
 	if (cf->can_id & CAN_EFF_FLAG) {
@@ -816,7 +1021,6 @@ static netdev_tx_t lscanfd_start_xmit(struct sk_buff *skb,
 
 	lscanfd_tx_add(priv, buf);
 
-	/* If every buffer is now pending, stop the queue */
 	if (FIELD_GET(LSCANFD_TX_STAT_BRP,
 		      lscanfd_read32(priv, LSCANFD_TX_STAT)) ==
 	    GENMASK(LSCANFD_TXBUF_NUM - 1, 0))
@@ -910,14 +1114,114 @@ static irqreturn_t lscanfd_interrupt(int irq, void *dev_id)
 			lscanfd_err_interrupt(ndev, isr);
 			lscanfd_int_unmask(priv, err_irq);
 		}
-
-		/* RXI/TXI/BSI/RXFI/OFI/DOI are not used by this driver */
 	}
 
-	netdev_err(ndev, "interrupt loop timeout, ISR=0x%08x\n", 
+	netdev_err(ndev, "interrupt loop timeout, ISR=0x%08x\n",
 		   lscanfd_read32(priv, LSCANFD_INT_STAT));
 	lscanfd_disable_interrupts(priv);
 	return IRQ_HANDLED;
+}
+
+/* -------------------------------------------------------------------------
+ * RX DMA setup / teardown
+ * ---------------------------------------------------------------------- */
+static int lscanfd_rxdma_init(struct net_device *ndev)
+{
+	struct lscanfd_priv *priv = netdev_priv(ndev);
+	struct device *dev = ndev->dev.parent;
+	struct dma_slave_config config;
+	int ret;
+
+	priv->rx_ch = dma_request_chan(dev, "rx");
+	if (IS_ERR(priv->rx_ch)) {
+		ret = PTR_ERR(priv->rx_ch);
+		priv->rx_ch = NULL;
+		return ret;
+	}
+
+	priv->rx_buf = dma_alloc_coherent(dev, LSCANFD_RXBUF_SZ,
+					  &priv->rx_dma_buf, GFP_KERNEL);
+	if (!priv->rx_buf) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	memset(&config, 0, sizeof(config));
+	config.src_addr = priv->phys_base + LSCANFD_RX_DATA;
+	config.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	config.src_maxburst = 1;
+	config.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	config.dst_maxburst = 1;
+	config.device_fc = false;	/* DMA engine is the flow controller */
+
+	ret = dmaengine_slave_config(priv->rx_ch, &config);
+	if (ret < 0) {
+		dev_err(dev, "RX DMA channel config failed\n");
+		goto err_free;
+	}
+
+	return 0;
+
+err_free:
+	dma_free_coherent(dev, LSCANFD_RXBUF_SZ, priv->rx_buf,
+			  priv->rx_dma_buf);
+	priv->rx_buf = NULL;
+err_release:
+	dma_release_channel(priv->rx_ch);
+	priv->rx_ch = NULL;
+	return ret;
+}
+
+static int lscanfd_rxdma_start(struct net_device *ndev)
+{
+	struct lscanfd_priv *priv = netdev_priv(ndev);
+	struct dma_async_tx_descriptor *desc;
+
+	if (!priv->rx_ch)
+		return 0;
+
+	desc = dmaengine_prep_dma_cyclic(priv->rx_ch, priv->rx_dma_buf,
+					 LSCANFD_RXBUF_SZ,
+					 LSCANFD_RXDMA_PERIOD,
+					 DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT);
+	if (!desc) {
+		netdev_err(ndev, "RX DMA cyclic prep failed\n");
+		return -EBUSY;
+	}
+
+	priv->rx_cookie = dmaengine_submit(desc);
+	if (dma_submit_error(priv->rx_cookie)) {
+		netdev_err(ndev, "RX DMA submit failed\n");
+		return -EIO;
+	}
+
+	/* Cyclic descriptor always starts at ring offset 0 */
+	priv->rx_rd_pos = 0;
+	priv->rx_wr_pos = 0;
+	priv->rx_wr_off = 0;
+	priv->rx_bad_cnt = 0;
+
+	dma_async_issue_pending(priv->rx_ch);
+	return 0;
+}
+
+static void lscanfd_rxdma_stop(struct lscanfd_priv *priv)
+{
+	if (!priv->rx_ch)
+		return;
+
+	dmaengine_terminate_sync(priv->rx_ch);
+}
+
+static void lscanfd_rxdma_remove(struct lscanfd_priv *priv, struct device *dev)
+{
+	if (!priv->rx_ch)
+		return;
+
+	dmaengine_terminate_sync(priv->rx_ch);
+	lscanfd_rxdata_dma_free(priv, dev);
+	dma_release_channel(priv->rx_ch);
+	priv->rx_ch = NULL;
 }
 
 /* -------------------------------------------------------------------------
@@ -949,10 +1253,15 @@ static int lscanfd_do_set_data_bittiming(struct net_device *ndev)
 static int lscanfd_do_set_mode(struct net_device *ndev, enum can_mode mode)
 {
 	struct lscanfd_priv *priv = netdev_priv(ndev);
+	int ret;
 
 	switch (mode) {
 	case CAN_MODE_START:
 		lscanfd_reset(priv);
+		lscanfd_rxdma_stop(priv);
+		ret = lscanfd_rxdma_start(ndev);
+		if (ret)
+			return ret;
 		lscanfd_chip_start(ndev);
 		netif_wake_queue(ndev);
 		return 0;
@@ -995,16 +1304,28 @@ static int lscanfd_open(struct net_device *ndev)
 
 	napi_enable(&priv->napi);
 
+	/*
+	 * Start the DMA engine before the controller: as soon as the
+	 * controller starts pushing data into RX_DATA, the DMA must
+	 * already be ready to consume it.
+	 */
+	ret = lscanfd_rxdma_start(ndev);
+	if (ret)
+		goto err_napi;
+
 	ret = lscanfd_chip_start(ndev);
 	if (ret) {
 		netdev_err(ndev, "chip_start failed\n");
-		goto err_napi;
+		goto err_dma;
 	}
 
 	netif_start_queue(ndev);
-	netdev_info(ndev, "Loongson CANFD device registered\n");
+	netdev_info(ndev, "Loongson CANFD device registered (%s)\n",
+		    priv->rx_ch ? "RX DMA" : "FIFO poll");
 	return 0;
 
+err_dma:
+	lscanfd_rxdma_stop(priv);
 err_napi:
 	napi_disable(&priv->napi);
 	free_irq(priv->irq, ndev);
@@ -1018,7 +1339,16 @@ static int lscanfd_close(struct net_device *ndev)
 	struct lscanfd_priv *priv = netdev_priv(ndev);
 
 	netif_stop_queue(ndev);
+
+	/*
+	 * Stop the controller (the data source) first, then the DMA
+	 * engine (the mover).  The reverse order would leave the DMA
+	 * reading an undefined RX_DATA while the controller is being
+	 * torn down.
+	 */
 	lscanfd_chip_stop(ndev);
+	lscanfd_rxdma_stop(priv);
+
 	napi_disable(&priv->napi);
 	free_irq(priv->irq, ndev);
 	close_candev(ndev);
@@ -1062,6 +1392,7 @@ static int lscanfd_probe(struct platform_device *pdev)
 
 	priv = netdev_priv(ndev);
 	priv->base = base;
+	priv->phys_base = res->start;
 	priv->irq = irq;
 	priv->clk_rate = clk_rate;
 	spin_lock_init(&priv->tx_lock);
@@ -1088,10 +1419,8 @@ static int lscanfd_probe(struct platform_device *pdev)
 	ndev->flags |= IFF_ECHO;
 	ndev->netdev_ops = &lscanfd_netdev_ops;
 	SET_NETDEV_DEV(ndev, dev);
-
 	platform_set_drvdata(pdev, ndev);
 
-	/* Check the controller ID */
 	if ((lscanfd_read32(priv, LSCANFD_CR_ID) & 0xffff) !=
 	    LSCANFD_DEVICE_ID) {
 		netdev_err(ndev, "LSCANFD signature not found\n");
@@ -1101,7 +1430,27 @@ static int lscanfd_probe(struct platform_device *pdev)
 
 	lscanfd_reset(priv);
 
-	/* RX/TX queues */
+	/*
+	 * Try to set up RX DMA.  Any failure is not fatal: the driver
+	 * falls back to FIFO polling, which is slower but always works.
+	 */
+	priv->get_rx_data = lscanfd_rxdata_poll;
+	priv->rxbuf_is_empty = lscanfd_rxbuf_is_empty;
+
+	if (!dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
+		ret = lscanfd_rxdma_init(ndev);
+		if (!ret) {
+			priv->get_rx_data = lscanfd_rxdata_dma;
+			priv->rxbuf_is_empty = lscanfd_rxbuf_is_empty_dma;
+		} else if (ret != -EPROBE_DEFER) {
+			dev_warn(dev,
+				 "RX DMA unavailable (%d), falling back to poll\n",
+				 ret);
+		}
+	} else {
+		dev_warn(dev, "32-bit DMA mask not supported, poll mode only\n");
+	}
+
 	priv->txb_head = 0;
 	priv->txb_tail = 0;
 
@@ -1117,6 +1466,7 @@ static int lscanfd_probe(struct platform_device *pdev)
 
 err_napi:
 	netif_napi_del(&priv->napi);
+	lscanfd_rxdma_remove(priv, dev);
 err_free:
 	free_candev(ndev);
 	return ret;
@@ -1129,6 +1479,7 @@ static void lscanfd_remove(struct platform_device *pdev)
 
 	unregister_candev(ndev);
 	netif_napi_del(&priv->napi);
+	lscanfd_rxdma_remove(priv, &pdev->dev);
 	free_candev(ndev);
 }
 
@@ -1152,5 +1503,5 @@ static struct platform_driver lscanfd_driver = {
 module_platform_driver(lscanfd_driver);
 
 MODULE_AUTHOR("Loongson Technology Corporation Limited");
-MODULE_DESCRIPTION("Loongson 2K3000 CAN-FD controller driver");
+MODULE_DESCRIPTION("Loongson 2K3000 CAN-FD controller driver with RX DMA");
 MODULE_LICENSE("GPL");
